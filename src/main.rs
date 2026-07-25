@@ -106,7 +106,7 @@ struct TranscribeArgs {
     /// optional grammar to also parse the transcript against
     #[arg(long)]
     grammar: Option<PathBuf>,
-    /// hotword bias file (one phrase per line; needs bpe.model in the model dir).
+    /// hotword bias file (one phrase per line; needs bpe.vocab in the model dir).
     /// Tip: `cmdtree hotwords <grammar> --out hw.txt` to generate one.
     #[arg(long)]
     hotwords: Option<PathBuf>,

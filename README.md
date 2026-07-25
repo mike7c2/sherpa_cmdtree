@@ -124,3 +124,7 @@ sudo usermod -aG input $USER    # then log out and back in
 ```
 
 [`evdev`]: https://crates.io/crates/evdev
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
