@@ -1,0 +1,44 @@
+[package]
+name = "cmdtree"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Voice command-tree grammar with free-text slots: YAML grammar, parser, phonetic quality assessment, and an optional push-to-talk daemon."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mike7c2/cmdtree"
+readme = "README.md"
+keywords = ["voice", "speech", "asr", "grammar", "push-to-talk"]
+categories = ["command-line-utilities", "multimedia::audio", "parser-implementations"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+
+# --- optional native deps ---
+cpal = { version = "0.15", optional = true }          # microphone capture (ALSA)
+evdev = { version = "0.12", optional = true }         # global hotkey via /dev/input (X11 + Wayland)
+# in-process sherpa-onnx ASR; `download-binaries` fetches the prebuilt native lib
+# (no local C++/CMake build). Add `sherpa-rs/cuda` for GPU (see the `sherpa-cuda` feature).
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "sys"], optional = true }
+
+[features]
+default = []
+# push-to-talk daemon with hotkey + mic capture; ASR via a pluggable backend.
+# The hotkey is read from /dev/input via evdev, so it works under both X11 and
+# Wayland (needs read access to /dev/input, i.e. membership in the `input` group).
+daemon = ["dep:cpal", "dep:evdev"]
+# native in-process ASR (sherpa-onnx offline transducer) + the `transcribe` CLI.
+sherpa = ["dep:sherpa-rs"]
+# sherpa with the CUDA execution provider (large GPU runtime download).
+sherpa-cuda = ["sherpa", "sherpa-rs/cuda"]
+
+[[bin]]
+name = "cmdtree"
+path = "src/main.rs"
+
+[lib]
+name = "cmdtree"
+path = "src/lib.rs"

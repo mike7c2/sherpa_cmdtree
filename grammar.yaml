@@ -1,0 +1,89 @@
+# A larger command tree, engineered for low ASR confusability.
+#
+# Design rules (verified with `cmdtree assess grammar.yaml`):
+#   * every command's routing keyword(s) are phonetically distinct from the others
+#   * enum options within a choice are kept phonetically apart
+#   * the ONE free-text slot ends on a distinctive anchor that is unlikely to be
+#     spoken inside the free text (so it never closes the slot early)
+#
+# Hotword bias list is derived automatically from this file: `cmdtree hotwords grammar.yaml`.
+fuzzy: 0.82
+commands:
+  # ---- smart home -------------------------------------------------------------
+  - name: light_power
+    action: light.power
+    pattern:
+      - {lit: switch}
+      - {one_of: {name: state, options: [on, off]}}
+      - {lit: the}
+      - {one_of: {name: device, options: ["kitchen light", "bedroom light", "desk lamp"]}}
+
+  - name: brightness
+    action: light.brightness
+    pattern:
+      - {lit: brightness}
+      - {one_of: {name: level, options: [low, medium, high]}}
+
+  - name: scene
+    action: scene.activate
+    pattern:
+      - {lit: activate}
+      # shared word "mode" factored into a literal so the choice stays distinct
+      - {one_of: {name: scene, options: [movie, reading, party]}}
+      - {lit: mode}
+
+  # ---- media ------------------------------------------------------------------
+  - name: volume
+    action: media.volume
+    pattern:
+      - {lit: volume}
+      - {one_of: {name: direction, options: [up, down]}}
+
+  - name: play_music
+    action: media.play
+    pattern:
+      - {lit: play}
+      - {one_of: {name: genre, options: [jazz, rock, classical, podcast]}}
+
+  - name: pause
+    action: media.pause
+    pattern:
+      - {lit: pause}
+
+  # ---- utilities --------------------------------------------------------------
+  - name: timer
+    action: timer.start
+    pattern:
+      - {lit: "set a timer for"}
+      # numbers only (distinct); the shared unit "minutes" is a fixed literal
+      - {one_of: {name: minutes, options: [two, five, ten, thirty]}}
+      - {lit: minutes}
+
+  - name: weather
+    action: info.weather
+    pattern:
+      - {lit: "weather in"}
+      - {one_of: {name: city, options: [glasgow, aberdeen, inverness, perth]}}
+
+  - name: navigate
+    action: nav.route
+    pattern:
+      - {lit: "navigate to"}
+      - {one_of: {name: destination, options: [home, work, "the airport", "the station"]}}
+
+  # "phone" not "call": /kɔːl/ collided with "pause" (/pɔːz/) as a routing key
+  - name: phone
+    action: phone.call
+    pattern:
+      - {lit: phone}
+      - {one_of: {name: contact, options: [mum, dad, alice, "the office"]}}
+
+  # ---- the single free-text command ------------------------------------------
+  # "take a note <free text> full stop" — a Scots/British dictation terminator that
+  # is distinctive, >2 phones, not a stop-word, and rare inside the note itself.
+  - name: dictate_note
+    action: notes.create
+    pattern:
+      - {lit: "take a note"}
+      - {slot: text}
+      - {lit: "full stop"}

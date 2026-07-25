@@ -1,0 +1,53 @@
+# Example command tree.
+#
+#   pattern elements:
+#     {lit: "some words"}                       fixed literal words
+#     {one_of: {name: X, options: [a, b, c]}}   bounded choice (enum) -> captured as slot X
+#     {slot: X}                                  FREE TEXT -> captured as slot X
+#
+# Rule: a {slot} MUST be followed by a literal/enum END ANCHOR, so the free text
+# is bounded on both sides and the parser always knows where it stops.
+#
+# Assess this file:  cmdtree assess grammar.example.yaml
+# Parse text:        cmdtree parse grammar.example.yaml --text "note that buy milk over"
+
+fuzzy: 0.82
+
+commands:
+  - name: add_note
+    action: notes.add
+    pattern:
+      - {lit: "note that"}
+      - {slot: text}
+      - {lit: over}
+
+  - name: send_message
+    action: messages.send
+    pattern:
+      - {lit: "send message to"}
+      - {one_of: {name: who, options: [alice, bob, mum]}}
+      - {lit: saying}
+      - {slot: body}
+      - {lit: send}
+
+  - name: set_light
+    action: lights.set
+    pattern:
+      - {lit: turn}
+      - {one_of: {name: state, options: [on, off]}}
+      - {lit: the}
+      - {one_of: {name: device, options: ["kitchen light", "bedroom light", lamp]}}
+
+  - name: search
+    action: web.search
+    pattern:
+      - {lit: "search for"}
+      - {slot: query}
+      - {lit: go}
+
+  - name: navigate
+    action: nav.to
+    pattern:
+      - {lit: "navigate to"}
+      - {slot: destination}
+      - {lit: go}
