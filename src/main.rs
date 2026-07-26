@@ -47,6 +47,24 @@ enum Cmd {
     /// Transcribe a WAV file with the native sherpa-onnx backend, and optionally
     /// parse it against a grammar (requires building with `--features sherpa`).
     Transcribe(TranscribeArgs),
+    /// Spot keywords in a WAV with a sherpa-onnx KWS model (wake/end-word check).
+    Spot(SpotArgs),
+}
+
+#[derive(clap::Args)]
+struct SpotArgs {
+    /// WAV file to scan (16 kHz mono PCM16)
+    #[arg(long)]
+    wav: PathBuf,
+    /// sherpa-onnx streaming KWS model dir (encoder/decoder/joiner ONNX + tokens.txt)
+    #[arg(long)]
+    kws_model: PathBuf,
+    /// tokenized keywords file; defaults to `<kws-model>/keywords.txt`
+    #[arg(long)]
+    keywords: Option<PathBuf>,
+    /// detection threshold in (0,1]; lower = more sensitive
+    #[arg(long, default_value_t = 0.25)]
+    threshold: f32,
 }
 
 #[derive(clap::Args)]
@@ -197,6 +215,7 @@ fn main() -> ExitCode {
         }
         Cmd::Daemon(args) => run_daemon(args),
         Cmd::Transcribe(args) => run_transcribe(args),
+        Cmd::Spot(args) => run_spot(args),
     }
 }
 
@@ -313,6 +332,55 @@ fn run_transcribe(args: TranscribeArgs) -> ExitCode {
 fn run_transcribe(_args: TranscribeArgs) -> ExitCode {
     eprintln!(
         "the `transcribe` subcommand needs the sherpa feature.\n\
+         rebuild with:  cargo build --release --features sherpa"
+    );
+    ExitCode::FAILURE
+}
+
+#[cfg(feature = "sherpa")]
+fn run_spot(args: SpotArgs) -> ExitCode {
+    let keywords = args
+        .keywords
+        .unwrap_or_else(|| args.kws_model.join("keywords.txt"));
+    let mut spotter = match cmdtree::kws::KeywordSpotter::from_dir(
+        &args.kws_model,
+        cmdtree::kws::KwsOpts {
+            keywords_file: keywords,
+            threshold: args.threshold,
+            ..Default::default()
+        },
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (samples, sample_rate) = match sherpa_rs::read_audio_file(&args.wav.to_string_lossy()) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("error reading {}: {e}", args.wav.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    // feed in 100 ms chunks, reporting hits with their approximate time
+    let chunk = (sample_rate / 10).max(1) as usize;
+    let mut hits = 0;
+    for (i, frame) in samples.chunks(chunk).enumerate() {
+        if let Some(kw) = spotter.accept(frame, sample_rate) {
+            let t = (i * chunk) as f32 / sample_rate as f32;
+            println!("{t:6.2}s  spotted: {kw:?}");
+            hits += 1;
+        }
+    }
+    eprintln!("{hits} keyword hit(s) in {}", args.wav.display());
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(feature = "sherpa"))]
+fn run_spot(_args: SpotArgs) -> ExitCode {
+    eprintln!(
+        "the `spot` subcommand needs the sherpa feature.\n\
          rebuild with:  cargo build --release --features sherpa"
     );
     ExitCode::FAILURE

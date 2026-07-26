@@ -18,6 +18,9 @@ pub mod wav;
 #[cfg(any(feature = "daemon", feature = "sherpa"))]
 pub mod asr;
 
+#[cfg(feature = "sherpa")]
+pub mod kws;
+
 #[cfg(feature = "daemon")]
 pub mod daemon;
 
