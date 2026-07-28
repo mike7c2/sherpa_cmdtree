@@ -1,12 +1,13 @@
 # cmdtree
 
-A voice **command-tree** grammar with free-text slots, plus tooling to judge how
-reliably an ASR will recognise it, and an optional push-to-talk daemon.
+A lean, low-latency, offline **voice command** recogniser: hold a hotkey, speak, release —
+a transcript from a local sherpa-onnx model is matched against a YAML command tree and
+emitted as a structured intent. Free-text dictation is available within specific commands.
 
-It is ASR-agnostic: recognition is produced by any speech recogniser (e.g. the
-streaming transducer in this repo, or sherpa-onnx). cmdtree turns a transcript
-into a structured command with typed slots, and lints your grammar for
-acoustic confusability.
+No cloud, no LLM, no wake word. Push-to-talk means the key delimits the utterance, so
+there is no VAD, no silence timeout, and nothing between key-release and the decode.
+
+See [SPEC.md](SPEC.md) for the full design and its rationale.
 
 ## Layout
 
@@ -18,12 +19,12 @@ crate (`lint/`) for grammar-quality authoring — so the runtime stays minimal.
 | Module | What |
 |---|---|
 | `grammar` | YAML command tree → compiled + validated form |
-| `parser`  | match a transcript → `{command, action, slots, leftover}` |
+| `parser`  | match a transcript → `{command, action, slots, score, leftover}` |
 | `hotwords` | derive a sherpa-onnx bias list from the grammar |
-| `wav`, `hotkey` | PCM16 WAV encode/resample + hotkey-combo parsing (pure, unit-tested) |
+| `wav`, `hotkey` | PCM16 WAV encode + hotkey-combo parsing (pure, unit-tested) |
 | `asr` *(feature `sherpa`)* | `SherpaTransducer` → text + per-word timings |
-| `kws` *(feature `sherpa`)* | streaming keyword spotter (wake / end word) |
-| `daemon` *(feature)* | hotkey or wake-word capture → ASR → parse → emit NDJSON |
+| `pulse` *(feature `daemon`)* | blocking 16 kHz mono capture via libpulse |
+| `daemon` *(feature `daemon`)* | hotkey-gated capture → ASR → parse → emit NDJSON |
 
 **`cmdtree-lint`** (dev tool): `phonetics` (espeak G2P + feature-weighted distance) and
 `assess` (confusability linter). Run it on a grammar; not part of the runtime.
@@ -31,18 +32,17 @@ crate (`lint/`) for grammar-quality authoring — so the runtime stays minimal.
 ## Build & test
 
 ```bash
-cargo test                       # core: grammar, parser, hotwords (no native deps)
-cargo build --release            # the `cmdtree` CLI (parse/hotwords)
-cargo build --release --features daemon          # + push-to-talk daemon (mic + hotkey)
-cargo build --release --features sherpa          # + native sherpa-onnx ASR, transcribe, spot
-cargo build --release --features daemon,sherpa   # daemon + in-process recognizer + wake word
-cargo run -p cmdtree-lint -- grammar.yaml        # grammar-quality report (needs espeak)
+cargo test                              # core: grammar, parser, hotwords (no native deps)
+cargo build --release                   # the `cmdtree` CLI (parse/hotwords)
+cargo build --release --features sherpa  # + in-process ASR and `transcribe`
+cargo build --release --features daemon  # + push-to-talk daemon (implies `sherpa`)
+cargo run -p cmdtree-lint -- grammar.yaml  # grammar-quality report (needs espeak)
 ```
 
-Features are additive: `daemon` links mic capture (cpal) and the evdev hotkey;
-`sherpa` links an in-process sherpa-onnx recognizer via [`sherpa-rs`] (its
-`download-binaries` feature fetches the prebuilt native lib — no local C++/CMake
-build). `sherpa-cuda` swaps in the CUDA execution provider.
+Features are additive. `sherpa` links an in-process sherpa-onnx recognizer via
+[`sherpa-rs`] (its `download-binaries` feature fetches the prebuilt native lib — no local
+C++/CMake build). `daemon` adds mic capture (libpulse) and the evdev hotkey, and implies
+`sherpa`. `sherpa-cuda` swaps in the CUDA execution provider.
 
 [`sherpa-rs`]: https://crates.io/crates/sherpa-rs
 
@@ -69,18 +69,23 @@ commands:
 text is bounded on both sides and the parser always knows where it stops. This is
 validated at load time.
 
+`grammar.yaml` is the reference tree (11 commands); `grammar.example.yaml` is a smaller
+starting point.
+
 ## CLI
 
 ```bash
-cargo run -p cmdtree-lint -- grammar.example.yaml   # grammar-quality report (add --json)
-cmdtree parse  grammar.example.yaml --text "turn off the kitchen light"
+cmdtree parse grammar.example.yaml --text "turn off the kitchen light"   # add --json
+cmdtree hotwords grammar.yaml --out hw.txt          # sherpa bias list from the grammar
 
-# push-to-talk daemon (feature `daemon`, which pulls in the sherpa recognizer):
-cmdtree daemon grammar.example.yaml --hotkey ctrl+space --sherpa-model models/onnx-zipformer-en
+# push-to-talk daemon (feature `daemon`):
+cmdtree daemon grammar.yaml --sherpa-model models/onnx-zipformer-en --hotkey ctrl+space
 
-# transcribe a file (no mic/hotkey needed; feature `sherpa`):
+# transcribe a file — no mic or hotkey needed (feature `sherpa`):
 cmdtree transcribe --wav utterance.wav --sherpa-model models/onnx-zipformer-en \
-        --grammar grammar.example.yaml
+        --grammar grammar.yaml
+
+cargo run -p cmdtree-lint -- grammar.yaml           # quality report (add --json)
 ```
 
 `cmdtree-lint` scores each command on phonetic confusability (feature-weighted, so a
@@ -90,40 +95,71 @@ for ground truth, synthesize each command and run it back through your recognise
 
 ## Daemon / push-to-talk
 
-Hold the hotkey (or say a wake word), speak, release — the captured audio is
-transcribed by `asr::SherpaTransducer`, an in-process sherpa-onnx offline transducer
-driven directly through [`sherpa-rs`]'s sys layer (so tokens + per-word timestamps are
-available). The `daemon` feature pulls in the recognizer, so `--sherpa-model` is required.
+Hold the hotkey, speak, release. The captured audio is transcribed by
+`asr::SherpaTransducer`, an in-process sherpa-onnx offline transducer driven directly
+through [`sherpa-rs`]'s sys layer (so tokens + per-word timestamps are available), then
+parsed against the grammar. The mic stream runs continuously and the key gates it, so
+capture starts the instant you press — including the frame the press landed in.
+
+Useful flags:
+
+- `--open-ended` — let a trailing free-text slot omit its end anchor, since key-release
+  already bounds the utterance (dictate a note without saying "full stop"). The anchor
+  stays in the grammar and is still consumed when spoken.
+- `--save-audio DIR` — write every processed utterance as a 16 kHz mono WAV plus a
+  `manifest.jsonl` row (transcript, parsed command, per-word timings): a dataset of your
+  own voice for seeing which words actually work.
+- `--no-bias` / `--bias-score N` — hotword biasing toward the grammar is on by default.
+
+### Output contract
+
+The daemon is a recogniser, not an executor: **stdout carries exactly one NDJSON event per
+utterance**, so you can pipe it straight into whatever performs the effects.
+
+```json
+{"ts":1730000000000,"command":"light_power","action":"light.power","slots":{"state":"on","device":"kitchen light"},"transcript":"SWITCH ON THE KITCHEN LIGHT"}
+```
+
+`command`/`action` are `null` and `slots` `{}` when nothing matched. Everything
+human-readable — capture duration, what was heard, per-word timings, errors — goes to
+**stderr**, so the two can be redirected apart:
+
+```bash
+cmdtree daemon grammar.yaml --sherpa-model MODEL 2>/dev/null | ./my-executor
+```
+
+### The model
 
 `--sherpa-model` takes a directory holding a sherpa-onnx zipformer transducer —
-`encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx` (full-precision preferred over
-`int8` when both are present) and `tokens.txt`. Note this is an **ONNX** model, not
-the TorchScript `cpu_jit.pt` the Python side uses; grab one from the
-[sherpa-onnx model zoo](https://github.com/k2-fsa/sherpa-onnx/releases). The
-`transcribe` subcommand runs a WAV through the same backend without a mic or
-hotkey — handy for testing a grammar against real audio.
+`encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx` (full-precision preferred over `int8`
+when both are present) and `tokens.txt`. Note this is an **ONNX** model, not a TorchScript
+`cpu_jit.pt`; grab one from the
+[sherpa-onnx model zoo](https://github.com/k2-fsa/sherpa-onnx/releases). A `bpe.vocab` in
+the same directory enables hotword biasing (without it, biasing warns and disables itself).
 
-### Platform support
+### Prerequisites
 
-| Piece | X11 | Wayland |
-|---|---|---|
-| Mic capture (cpal/ALSA/PipeWire) | ✅ | ✅ |
-| Transcribe + parse | ✅ | ✅ |
-| **Global hotkey** (`evdev`, `/dev/input`) | ✅ | ✅ |
+| Piece | Requirement |
+|---|---|
+| Mic capture | a PulseAudio-compatible server — PipeWire's `pipewire-pulse`, or PulseAudio |
+| Global hotkey | read access to `/dev/input`, i.e. membership in the `input` group |
+| `cmdtree-lint` | `espeak` on `PATH` (authoring only, not a runtime dep) |
 
-The global hotkey is read from `/dev/input` via [`evdev`], which sits **below** the
-display server — so the same code works on X11 and Wayland alike (Wayland forbids
-reading global key state through the display server, which is why an X11 key-grab
-would not port). Every keyboard device is monitored, so a modifier and key pressed
-on different keyboards still combine, and left/right modifier variants fold to one
-token (`ctrl+space` fires from either Ctrl).
+The hotkey is read from `/dev/input` via [`evdev`], which sits **below** the display
+server — so the same code works on X11 and Wayland alike (Wayland forbids reading global
+key state through the display server, which is why an X11 key-grab would not port). Every
+keyboard device is monitored, so a modifier and key pressed on different keyboards still
+combine, and left/right modifier variants fold to one token (`ctrl+space` fires from
+either Ctrl).
 
-**Access:** reading `/dev/input` requires membership in the `input` group. If the
-daemon reports a permission error, run:
+If the daemon reports a permission error reading `/dev/input`:
 
 ```bash
 sudo usermod -aG input $USER    # then log out and back in
 ```
+
+Audio goes through the sound server, which owns resampling, downmixing, and sharing the
+mic with other applications — cmdtree just asks for 16 kHz mono and reads frames.
 
 [`evdev`]: https://crates.io/crates/evdev
 

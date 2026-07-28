@@ -1,24 +1,17 @@
 # cmdtree — Specification
 
-A lean, offline **voice command** recogniser: hold a hotkey, speak, release, and a
-transcript from a local sherpa-onnx model is matched against a YAML command tree.
-Free-text dictation is available as an explicit command. On-device, **tiny latency**,
-no cloud, no LLM.
-
-Status: working end-to-end (pure push-to-talk; wake-word support was built, then
-removed — see §2). Audio is native libpulse (§7). Anything under **Deferred** is
-out of scope until explicitly pulled in.
+A lean, low latency, offline **voice command** recogniser: hold a hotkey, speak, release, and a transcript from a local sherpa-onnx model is matched against a YAML command tree.
+Free-text dictation is available within specific commands.
 
 ---
 
-## 1. Purpose & core elements
-
-Three things, deliberately kept small:
+## 1. Core elements
 
 1. **sherpa** — recognition by a local sherpa-onnx offline transducer.
 2. **a command grammar** — a YAML tree of commands with typed enum choices and free-text slots.
-3. **tools that make it effective** — a confusability linter, auto-derived hotword biasing,
-   and per-utterance audio+transcript capture.
+3. **PTT** — user delimits audio with push to talk, avoiding complexity and latency of VAD/Wake word
+4. **Support tooling** — a linter is provided to help design an easily distinguishable command
+   tree, plus grammar-derived hotword biasing and per-utterance voice-data capture
 
 ## 2. Scope
 
@@ -139,7 +132,8 @@ the dataset for seeing which words work on the user's voice. The WAV stem, manif
 
 - **Model:** a sherpa-onnx **offline** transducer (encoder/decoder/joiner `.onnx` +
   `tokens.txt`), auto-discovered (full-precision preferred over int8). This is an **ONNX**
-  model, distinct from the repo's TorchScript streaming model. `bpe.vocab` needed for biasing.
+  model — not a TorchScript `cpu_jit.pt`, which is a different artifact entirely.
+  `bpe.vocab` (same dir) is needed for hotword biasing.
 - **Hotkey:** evdev reads `/dev/input` → works on X11 **and** Wayland, but needs
   membership in the `input` group.
 - **Audio:** libpulse via `libpulse-simple-binding` (built with `default-features = false`
@@ -164,7 +158,12 @@ combos; `cargo package --list` clean.
   custom scripts). cmdtree never grows built-in integrations; `action`+`slots` is the contract.
   Optional extra-hotwords list (names/jargon, e.g. "Tuvok") merged with the grammar-derived
   bias list is the one biasing add still worth doing.
-- `--source NAME` pulse source selector (trivial via `pa_simple`; add when needed).
+- `--source NAME` pulse source selector (a `Simple::new` argument we currently pass as
+  `None` = default source; add when needed).
+- **Grammar-trellis rescoring** — decode grammar candidates directly against the acoustics
+  instead of transcribing then text-matching, with a likelihood ratio against the
+  unconstrained decode for calibrated rejection. Specced in `EXPERIMENT.md`; gated behind a
+  parity milestone and an evaluation, with no runtime changes until those pass.
 - Surfacing `Match.score` as a confidence readout / manifest field.
 - Fine-tuning the transducer on the user's voice (uses the `--save-audio` corpus).
 - CUDA execution provider (`sherpa-cuda`) — not needed for command latency.
