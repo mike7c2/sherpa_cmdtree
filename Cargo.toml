@@ -22,7 +22,9 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "1"
 
 # --- optional native deps ---
-cpal = { version = "0.15", optional = true }          # microphone capture (ALSA)
+# microphone capture; the server does resampling/downmix/sharing for us
+libpulse-binding = { version = "2", default-features = false, optional = true }
+libpulse-simple-binding = { version = "2", default-features = false, optional = true }
 evdev = { version = "0.12", optional = true }         # global hotkey via /dev/input (X11 + Wayland)
 # in-process sherpa-onnx ASR; `download-binaries` fetches the prebuilt native lib
 # (no local C++/CMake build). Add `sherpa-rs/cuda` for GPU (see the `sherpa-cuda` feature).
@@ -31,9 +33,10 @@ sherpa-rs = { version = "0.6.8", default-features = false, features = ["download
 [features]
 default = []
 # pure push-to-talk daemon: hotkey-gated mic capture + in-process sherpa ASR.
-# The hotkey is read from /dev/input via evdev, so it works under both X11 and
-# Wayland (needs read access to /dev/input, i.e. membership in the `input` group).
-daemon = ["dep:cpal", "dep:evdev", "sherpa"]
+# Links system libpulse (needs a PulseAudio-compatible server at runtime, e.g.
+# pipewire-pulse). The hotkey is read from /dev/input via evdev, so it works under
+# both X11 and Wayland (needs membership in the `input` group).
+daemon = ["dep:evdev", "dep:libpulse-binding", "dep:libpulse-simple-binding", "sherpa"]
 # native in-process ASR (sherpa-onnx offline transducer) + the `transcribe` CLI.
 sherpa = ["dep:sherpa-rs"]
 # sherpa with the CUDA execution provider (large GPU runtime download).

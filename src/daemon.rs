@@ -3,7 +3,7 @@
 //! grammar, and emitted as one NDJSON intent on stdout (diagnostics on stderr).
 //!
 //! Feature-gated (`--features daemon`, which pulls in `sherpa`) because it links
-//! native audio (cpal/ALSA) and the sherpa-onnx recognizer. The hotkey is read from
+//! native audio (libpulse) and the sherpa-onnx recognizer. The hotkey is read from
 //! `/dev/input` via evdev, so it works under both X11 and Wayland (unlike an X11
 //! key-grab); it needs read access to the input devices, i.e. membership in the
 //! `input` group.
@@ -11,9 +11,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::{Arc, Mutex};
 
 use crate::asr::{SherpaOpts, SherpaTransducer};
 use crate::grammar::Grammar;
@@ -243,69 +241,6 @@ fn monitor_device(
     }
 }
 
-fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
-    if channels <= 1 {
-        return interleaved.to_vec();
-    }
-    interleaved
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
-}
-
-/// Build a continuously-running input stream that sends every captured mono f32
-/// frame to `frame_tx`. Returns the stream (keep alive) and its sample rate.
-fn build_input_stream(
-    frame_tx: mpsc::Sender<Vec<f32>>,
-) -> Result<(cpal::Stream, u32), String> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "no default input device".to_string())?;
-    let supported = device
-        .default_input_config()
-        .map_err(|e| e.to_string())?;
-    let sample_rate = supported.sample_rate().0;
-    let channels = supported.channels() as usize;
-    let config: cpal::StreamConfig = supported.clone().into();
-    let err_fn = |e| eprintln!("audio stream error: {e}");
-
-    macro_rules! push {
-        ($to_f32:expr) => {{
-            let tx = frame_tx.clone();
-            move |data: &[_], _: &cpal::InputCallbackInfo| {
-                let f: Vec<f32> = data.iter().map(|&s| $to_f32(s)).collect();
-                let _ = tx.send(downmix(&f, channels));
-            }
-        }};
-    }
-
-    let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config,
-            push!(|s: f32| s),
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config,
-            push!(|s: i16| s as f32 / 32768.0),
-            err_fn,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &config,
-            push!(|s: u16| (s as f32 - 32768.0) / 32768.0),
-            err_fn,
-            None,
-        ),
-        other => return Err(format!("unsupported sample format: {other:?}")),
-    }
-    .map_err(|e| e.to_string())?;
-
-    Ok((stream, sample_rate))
-}
-
 /// Recognise one captured utterance (16 kHz mono): diagnostics to stderr, the NDJSON
 /// intent to stdout, and an optional saved snippet.
 fn process_utterance(
@@ -381,10 +316,10 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
         );
     }
 
-    // Continuous mic → frames.
-    let (frame_tx, frame_rx) = mpsc::channel::<Vec<f32>>();
-    let (stream, in_rate) = build_input_stream(frame_tx)?;
-    stream.play().map_err(|e| e.to_string())?;
+    // Continuous 16 kHz mono capture from the server's default source; the server
+    // handles resampling/downmixing and mic sharing.
+    const FRAME: usize = 160; // 10 ms — the press/release latency granularity
+    let mut mic = crate::pulse::Recorder::open(FRAME)?;
 
     // hotkey monitoring: evdev reads /dev/input directly (X11 + Wayland). One thread
     // per keyboard, all sharing the `pressed` set; they set `ptt_held`.
@@ -414,14 +349,11 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
     // mic. Press starts buffering (including the frame the press landed in, so
     // speech beginning with the press isn't clipped); release hands the utterance
     // straight to the recognizer. The key is the only authority — no VAD, no caps.
-    let mut resampler = wav::StreamResampler::new(in_rate, 16_000);
+    let mut frame = vec![0.0f32; FRAME];
     let mut cmd = Vec::<f32>::new();
     let mut capturing = false;
-    for raw in frame_rx {
-        let frame = resampler.process(&raw);
-        if frame.is_empty() {
-            continue;
-        }
+    loop {
+        mic.read(&mut frame)?;
         let held = ptt_held.load(Ordering::SeqCst);
         if held && !capturing {
             eprintln!("🎤 listening…");
@@ -444,7 +376,6 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

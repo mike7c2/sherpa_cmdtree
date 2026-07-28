@@ -6,8 +6,8 @@ Free-text dictation is available as an explicit command. On-device, **tiny laten
 no cloud, no LLM.
 
 Status: working end-to-end (pure push-to-talk; wake-word support was built, then
-removed — see §2). One planned change remains: cpal/ALSA → libpulse (§7). Anything
-under **Deferred** is out of scope until explicitly pulled in.
+removed — see §2). Audio is native libpulse (§7). Anything under **Deferred** is
+out of scope until explicitly pulled in.
 
 ---
 
@@ -57,6 +57,7 @@ no quality-linting code.
 | `hotwords` | derive the sherpa hotword bias list from the grammar | core |
 | `wav`, `hotkey` | PCM16 WAV encode (for `--save-audio`); hotkey-combo parsing | core |
 | `asr` | `SherpaTransducer` (sherpa-onnx recognizer) → `AsrResult` | feature `sherpa` |
+| `pulse` | blocking 16 kHz mono capture (libpulse-simple-binding) | feature `daemon` |
 | `daemon` | hotkey-gated capture → ASR → parse → emit | feature `daemon` |
 
 `cmdtree-lint` modules (dev tool, depends on `cmdtree` for the grammar types):
@@ -64,7 +65,7 @@ no quality-linting code.
 linter). Needs espeak at runtime; not part of the recognizer.
 
 **Cargo features (cmdtree):** `default = []` · `sherpa = [sherpa-rs]` ·
-`daemon = [audio, evdev, sherpa]` (implies sherpa; audio = cpal today, libpulse per §7) ·
+`daemon = [evdev, libpulse-binding, libpulse-simple-binding, sherpa]` ·
 `sherpa-cuda = [sherpa, sherpa-rs/cuda]`. Core (grammar/parser/hotwords) builds with no
 native deps.
 
@@ -141,11 +142,11 @@ the dataset for seeing which words work on the user's voice. The WAV stem, manif
   model, distinct from the repo's TorchScript streaming model. `bpe.vocab` needed for biasing.
 - **Hotkey:** evdev reads `/dev/input` → works on X11 **and** Wayland, but needs
   membership in the `input` group.
-- **Audio (planned swap):** libpulse (`pa_simple`), requiring a PulseAudio-compatible
-  server (PipeWire's `pipewire-pulse`, or PulseAudio) — a given on both target boxes.
-  The server delivers 16 kHz mono f32 directly (no client-side resampling/downmix) and
-  small fragments are requested to keep capture latency low. Until the swap: cpal
-  default device + in-process resampling.
+- **Audio:** libpulse via `libpulse-simple-binding` (built with `default-features = false`
+  = oldest PA API baseline, so it runs against any newer server), requiring a
+  PulseAudio-compatible server at runtime (PipeWire's `pipewire-pulse`, or PulseAudio).
+  The server delivers 16 kHz mono f32 directly — no client-side resampling/downmix —
+  in 10 ms fragments, and mic sharing with other consumers is the server's job.
 - **espeak** required by `cmdtree-lint` only (predictive proxy; not a runtime dep).
 - **Latency budget (the core goal):** press → capture is immediate (the stream never
   stops; the press frame is included). Release → NDJSON event ≈ offline decode ≈ 20 ms

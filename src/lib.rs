@@ -4,6 +4,7 @@
 //! * [`parser`] — match a transcript against the tree, extracting slot values.
 //! * [`hotwords`] — derive a sherpa-onnx bias list from a grammar.
 //! * `asr` (feature `sherpa`) — the sherpa-onnx recognizer.
+//! * `pulse` (feature `daemon`) — blocking 16 kHz mono capture via libpulse.
 //! * `daemon` (feature `daemon`) — push-to-talk capture + ASR + parse + emit.
 
 pub mod grammar;
@@ -17,6 +18,9 @@ pub mod asr;
 
 #[cfg(feature = "daemon")]
 pub mod daemon;
+
+#[cfg(feature = "daemon")]
+pub mod pulse;
 
 pub use grammar::{Command, Comp, Grammar, GrammarError, OneOf};
 pub use parser::Match;
