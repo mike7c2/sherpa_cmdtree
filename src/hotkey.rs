@@ -28,23 +28,21 @@ pub fn normalize_key(tok: &str) -> String {
 
 impl Combo {
     /// Parse a `+`-separated combo string, e.g. "ctrl+space".
-    pub fn parse(s: &str) -> Combo {
-        let keys = s
+    pub fn parse(s: &str) -> Result<Combo, String> {
+        let keys: Vec<String> = s
             .split('+')
             .map(normalize_key)
             .filter(|k| !k.is_empty())
             .collect();
-        Combo { keys }
+        if keys.is_empty() {
+            return Err(format!("could not parse hotkey {s:?}"));
+        }
+        Ok(Combo { keys })
     }
 
     /// True when every key of the combo is currently held.
     pub fn is_satisfied(&self, pressed: &HashSet<String>) -> bool {
-        !self.keys.is_empty() && self.keys.iter().all(|k| pressed.contains(k))
-    }
-
-    /// True when the combo involves `key` (used to detect release).
-    pub fn contains(&self, key: &str) -> bool {
-        self.keys.iter().any(|k| k == key)
+        self.keys.iter().all(|k| pressed.contains(k))
     }
 }
 
@@ -58,21 +56,16 @@ mod tests {
 
     #[test]
     fn parses_and_normalizes_aliases() {
-        assert_eq!(Combo::parse("Control+Space").keys, vec!["ctrl", "space"]);
-        assert_eq!(Combo::parse("cmd+k").keys, vec!["meta", "k"]);
+        assert_eq!(Combo::parse("Control+Space").unwrap().keys, vec!["ctrl", "space"]);
+        assert_eq!(Combo::parse("cmd+k").unwrap().keys, vec!["meta", "k"]);
+        assert!(Combo::parse("++").is_err());
     }
 
     #[test]
     fn satisfied_only_when_all_held() {
-        let c = Combo::parse("ctrl+space");
+        let c = Combo::parse("ctrl+space").unwrap();
         assert!(!c.is_satisfied(&set(&["ctrl"])));
         assert!(c.is_satisfied(&set(&["ctrl", "space"])));
         assert!(c.is_satisfied(&set(&["ctrl", "space", "shift"]))); // extra keys ok
-    }
-
-    #[test]
-    fn contains_detects_release_key() {
-        assert!(Combo::parse("ctrl+alt+k").contains("k"));
-        assert!(!Combo::parse("ctrl+alt+k").contains("space"));
     }
 }

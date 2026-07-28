@@ -1,6 +1,6 @@
-//! Voice daemon: capture the mic via push-to-talk or a wake word, recognise with
-//! the in-process sherpa-onnx transducer, parse against the grammar, and emit one
-//! NDJSON intent per utterance on stdout (diagnostics on stderr).
+//! Voice daemon: pure push-to-talk — hold the hotkey, speak, release. The utterance
+//! is recognised with the in-process sherpa-onnx transducer, parsed against the
+//! grammar, and emitted as one NDJSON intent on stdout (diagnostics on stderr).
 //!
 //! Feature-gated (`--features daemon`, which pulls in `sherpa`) because it links
 //! native audio (cpal/ALSA) and the sherpa-onnx recognizer. The hotkey is read from
@@ -35,23 +35,9 @@ pub struct DaemonConfig {
     pub bias: bool,
     /// boost applied to biased hotword phrases.
     pub bias_score: f32,
-    /// PTT: let a trailing free-text slot omit its end anchor (the key-release bounds
+    /// let a trailing free-text slot omit its end anchor (the key-release bounds
     /// the utterance). The anchor stays in the grammar and is still used when spoken.
     pub open_ended: bool,
-    /// always-on wake-word mode: dir of a sherpa-onnx **streaming** KWS model (needs
-    /// feature `sherpa`). Coexists with the hotkey.
-    pub wake_model: Option<PathBuf>,
-    /// tokenized keywords file; defaults to `<wake_model>/keywords.txt`.
-    pub keywords: Option<PathBuf>,
-    /// a spotted phrase that ends capture immediately (fast path); otherwise capture
-    /// ends on trailing silence or the max-duration cap.
-    pub end_word: Option<String>,
-    /// KWS detection threshold in (0,1]; lower = more sensitive.
-    pub wake_threshold: f32,
-    /// end a wake capture after this much trailing silence (seconds).
-    pub silence_secs: f32,
-    /// hard cap on a single captured utterance (seconds).
-    pub max_utterance_secs: f32,
 }
 
 /// Milliseconds since the Unix epoch.
@@ -66,14 +52,7 @@ fn epoch_ms() -> u64 {
 /// structured intent a downstream executor acts on (`command`/`action`/`slots` are
 /// null/empty when nothing matched).
 fn event_json(transcript: &str, matched: Option<&crate::parser::Match>, ts: u64) -> String {
-    let slots: serde_json::Map<String, serde_json::Value> = matched
-        .map(|m| {
-            m.slots
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let slots = matched.map(|m| m.slots_json()).unwrap_or_default();
     let event = serde_json::json!({
         "ts": ts,
         "command": matched.map(|m| m.command.clone()),
@@ -84,8 +63,9 @@ fn event_json(transcript: &str, matched: Option<&crate::parser::Match>, ts: u64)
     serde_json::to_string(&event).unwrap_or_default()
 }
 
-/// Write one processed utterance to `dir`: a timestamped 16 kHz mono WAV and an
-/// appended `manifest.jsonl` row tying the audio to its transcript and parsed command.
+/// Write one processed utterance to `dir`: a 16 kHz mono WAV stamped with the
+/// event's `ts` and an appended `manifest.jsonl` row tying the audio to its
+/// transcript and parsed command.
 fn save_snippet(
     dir: &std::path::Path,
     samples: &[f32],
@@ -93,24 +73,14 @@ fn save_snippet(
     transcript: &str,
     matched: Option<&crate::parser::Match>,
     words: &[(String, f32)],
+    ts: u64,
 ) -> std::io::Result<()> {
     use std::io::Write;
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let stem = format!("utterance-{ms}");
+    let stem = format!("utterance-{ts}");
     let pcm = wav::f32_to_i16(samples);
     std::fs::write(dir.join(format!("{stem}.wav")), wav::encode_pcm16_mono(&pcm, sample_rate))?;
 
-    let slots: serde_json::Map<String, serde_json::Value> = matched
-        .map(|m| {
-            m.slots
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let slots = matched.map(|m| m.slots_json()).unwrap_or_default();
     // per-word recognition detail (which words came out, and when) for post-analysis
     let words_json: Vec<serde_json::Value> = words
         .iter()
@@ -118,7 +88,7 @@ fn save_snippet(
         .collect();
     let entry = serde_json::json!({
         "wav": format!("{stem}.wav"),
-        "epoch_ms": ms as u64,
+        "epoch_ms": ts,
         "transcript": transcript,
         "command": matched.map(|m| m.command.clone()),
         "action": matched.and_then(|m| m.action.clone()),
@@ -336,30 +306,6 @@ fn build_input_stream(
     Ok((stream, sample_rate))
 }
 
-/// Capture state over the continuous frame stream.
-enum Capture {
-    Idle,
-    /// capturing because the hotkey is held (stops on release).
-    Ptt,
-    /// capturing because a wake word fired (stops on end word / silence / max).
-    Wake { silence: usize, heard: bool },
-}
-
-fn kws_accept(kws: &mut Option<crate::kws::KeywordSpotter>, frame: &[f32]) -> Option<String> {
-    kws.as_mut().and_then(|k| k.accept(frame, 16_000))
-}
-
-fn rms(frame: &[f32]) -> f32 {
-    if frame.is_empty() {
-        return 0.0;
-    }
-    (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt()
-}
-
-fn is_end_word(kw: &str, end_word: &Option<String>) -> bool {
-    end_word.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(kw))
-}
-
 /// Recognise one captured utterance (16 kHz mono): diagnostics to stderr, the NDJSON
 /// intent to stdout, and an optional saved snippet.
 fn process_utterance(
@@ -391,9 +337,11 @@ fn process_utterance(
                 }
                 None => eprintln!("  → (no command recognised)"),
             }
-            println!("{}", event_json(&res.text, m.as_ref(), epoch_ms()));
+            let ts = epoch_ms();
+            println!("{}", event_json(&res.text, m.as_ref(), ts));
             if let Some(dir) = save_audio {
-                if let Err(e) = save_snippet(dir, samples, 16_000, &res.text, m.as_ref(), &words) {
+                if let Err(e) = save_snippet(dir, samples, 16_000, &res.text, m.as_ref(), &words, ts)
+                {
                     eprintln!("could not save audio snippet: {e}");
                 }
             }
@@ -403,21 +351,18 @@ fn process_utterance(
 }
 
 pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
-    let combo = Combo::parse(&cfg.hotkey);
-    if combo.keys.is_empty() {
-        return Err(format!("could not parse hotkey {:?}", cfg.hotkey));
-    }
+    let combo = Combo::parse(&cfg.hotkey)?;
 
     // Auto-derive a hotword bias list from the command tree so biasing always
     // matches the grammar (written to a temp file the recognizer reads).
     let hotwords_path: Option<PathBuf> = if cfg.bias {
-        let phrases = crate::hotwords::hotwords(&grammar);
+        let text = crate::hotwords::hotwords_file(&grammar, None);
         let path = std::env::temp_dir().join(format!("cmdtree-hotwords-{}.txt", std::process::id()));
-        std::fs::write(&path, crate::hotwords::hotwords_file(&grammar, None))
+        std::fs::write(&path, &text)
             .map_err(|e| format!("cannot write hotwords file {}: {e}", path.display()))?;
         eprintln!(
             "biasing {} hotword phrases derived from the grammar (score {})",
-            phrases.len(),
+            text.lines().count(),
             cfg.bias_score
         );
         Some(path)
@@ -435,34 +380,6 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
             dir.display()
         );
     }
-
-    // Optional always-on wake-word front-end.
-    let mut kws: Option<crate::kws::KeywordSpotter> = match &cfg.wake_model {
-        Some(dir) => {
-            let keywords = cfg
-                .keywords
-                .clone()
-                .unwrap_or_else(|| dir.join("keywords.txt"));
-            let spotter = crate::kws::KeywordSpotter::from_dir(
-                dir,
-                crate::kws::KwsOpts {
-                    keywords_file: keywords,
-                    threshold: cfg.wake_threshold,
-                    ..Default::default()
-                },
-            )?;
-            eprintln!(
-                "wake-word mode on (threshold {}{})",
-                cfg.wake_threshold,
-                cfg.end_word
-                    .as_deref()
-                    .map(|e| format!(", end word {e:?}"))
-                    .unwrap_or_default()
-            );
-            Some(spotter)
-        }
-        None => None,
-    };
 
     // Continuous mic → frames.
     let (frame_tx, frame_rx) = mpsc::channel::<Vec<f32>>();
@@ -488,97 +405,42 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
 
     // stdout carries ONE NDJSON event per utterance (for a downstream executor);
     // everything human-readable goes to stderr, so the two can be piped apart.
-    if cfg.wake_model.is_some() {
-        eprintln!(
-            "cmdtree daemon ready. Say a wake word, or hold [{}]. Ctrl-C to quit.",
-            cfg.hotkey
-        );
-    } else {
-        eprintln!(
-            "cmdtree daemon ready. Hold [{}] and speak; release to recognise. Ctrl-C to quit.",
-            cfg.hotkey
-        );
-    }
+    eprintln!(
+        "cmdtree daemon ready. Hold [{}] and speak; release to recognise. Ctrl-C to quit.",
+        cfg.hotkey
+    );
 
-    // Unified capture loop over the 16 kHz frame stream. PTT and wake both feed it.
-    const SILENCE_RMS: f32 = 0.015;
-    const END_WORD_TRIM_S: f32 = 0.5; // drop the trailing end-word audio from the command
-    let secs = |n: usize| n as f32 / 16_000.0;
+    // Capture loop over the 16 kHz frame stream: the hotkey gates the continuous
+    // mic. Press starts buffering (including the frame the press landed in, so
+    // speech beginning with the press isn't clipped); release hands the utterance
+    // straight to the recognizer. The key is the only authority — no VAD, no caps.
+    let mut resampler = wav::StreamResampler::new(in_rate, 16_000);
     let mut cmd = Vec::<f32>::new();
-    let mut state = Capture::Idle;
+    let mut capturing = false;
     for raw in frame_rx {
-        if raw.is_empty() {
+        let frame = resampler.process(&raw);
+        if frame.is_empty() {
             continue;
         }
-        let frame = wav::resample_linear(&raw, in_rate, 16_000);
-        let ptt = ptt_held.load(Ordering::SeqCst);
-        match &mut state {
-            Capture::Idle => {
-                if ptt {
-                    cmd.clear();
-                    cmd.extend_from_slice(&frame);
-                    eprintln!("🎤 listening… (ptt)");
-                    state = Capture::Ptt;
-                } else if let Some(kw) = kws_accept(&mut kws, &frame) {
-                    if !is_end_word(&kw, &cfg.end_word) {
-                        eprintln!("🔔 wake: {kw:?}");
-                        cmd.clear();
-                        state = Capture::Wake {
-                            silence: 0,
-                            heard: false,
-                        };
-                    }
-                }
-            }
-            Capture::Ptt => {
-                cmd.extend_from_slice(&frame);
-                if !ptt {
-                    process_utterance(
-                        &cmd,
-                        &recognizer,
-                        &grammar,
-                        cfg.open_ended,
-                        cfg.save_audio.as_deref(),
-                    );
-                    cmd.clear();
-                    state = Capture::Idle;
-                }
-            }
-            Capture::Wake { silence, heard } => {
-                cmd.extend_from_slice(&frame);
-                let mut stop = false;
-                let mut trim = 0usize;
-                if let Some(kw) = kws_accept(&mut kws, &frame) {
-                    if is_end_word(&kw, &cfg.end_word) {
-                        eprintln!("🔚 end: {kw:?}");
-                        stop = true;
-                        trim = (END_WORD_TRIM_S * 16_000.0) as usize;
-                    }
-                }
-                if rms(&frame) >= SILENCE_RMS {
-                    *heard = true;
-                    *silence = 0;
-                } else {
-                    *silence += frame.len();
-                }
-                if *heard && secs(*silence) >= cfg.silence_secs {
-                    stop = true;
-                }
-                if secs(cmd.len()) >= cfg.max_utterance_secs {
-                    stop = true;
-                }
-                if stop {
-                    let end = cmd.len().saturating_sub(trim);
-                    process_utterance(
-                        &cmd[..end],
-                        &recognizer,
-                        &grammar,
-                        cfg.open_ended,
-                        cfg.save_audio.as_deref(),
-                    );
-                    cmd.clear();
-                    state = Capture::Idle;
-                }
+        let held = ptt_held.load(Ordering::SeqCst);
+        if held && !capturing {
+            eprintln!("🎤 listening…");
+            cmd.clear();
+            capturing = true;
+        }
+        if capturing {
+            cmd.extend_from_slice(&frame);
+            if !held {
+                eprintln!("⏹ {:.1}s captured", cmd.len() as f32 / 16_000.0);
+                process_utterance(
+                    &cmd,
+                    &recognizer,
+                    &grammar,
+                    cfg.open_ended,
+                    cfg.save_audio.as_deref(),
+                );
+                cmd.clear();
+                capturing = false;
             }
         }
     }
@@ -622,7 +484,7 @@ mod tests {
 
         let samples = vec![0.0f32; 1600]; // 0.1 s @ 16 kHz
         let words = [("TURN".to_string(), 0.1), ("ON".to_string(), 0.4)];
-        save_snippet(&dir, &samples, 16000, "TURN ON THE LAMP", None, &words).unwrap();
+        save_snippet(&dir, &samples, 16000, "TURN ON THE LAMP", None, &words, 42).unwrap();
 
         // exactly one WAV, with a valid RIFF header
         let wavs: Vec<_> = std::fs::read_dir(&dir)
@@ -637,7 +499,7 @@ mod tests {
         let manifest = std::fs::read_to_string(dir.join("manifest.jsonl")).unwrap();
         assert_eq!(manifest.lines().count(), 1);
         assert!(manifest.contains(r#""transcript":"TURN ON THE LAMP""#));
-        assert!(manifest.contains(r#""epoch_ms":"#));
+        assert!(manifest.contains(r#""epoch_ms":42"#));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -664,7 +526,7 @@ mod tests {
         use crate::hotkey::Combo;
         use std::collections::HashSet;
         // a right-ctrl + space press must satisfy a "ctrl+space" combo.
-        let combo = Combo::parse("ctrl+space");
+        let combo = Combo::parse("ctrl+space").unwrap();
         let pressed: HashSet<String> = [Key::KEY_RIGHTCTRL, Key::KEY_SPACE]
             .into_iter()
             .map(norm_key)

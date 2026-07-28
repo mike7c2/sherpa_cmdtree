@@ -4,8 +4,7 @@
 //! * [`parser`] — match a transcript against the tree, extracting slot values.
 //! * [`hotwords`] — derive a sherpa-onnx bias list from a grammar.
 //! * `asr` (feature `sherpa`) — the sherpa-onnx recognizer.
-//! * `kws` (feature `sherpa`) — streaming keyword spotter (wake / end word).
-//! * `daemon` (feature `daemon`) — hotkey/wake-word capture + ASR + parse + emit.
+//! * `daemon` (feature `daemon`) — push-to-talk capture + ASR + parse + emit.
 
 pub mod grammar;
 pub mod hotkey;
@@ -15,9 +14,6 @@ pub mod wav;
 
 #[cfg(feature = "sherpa")]
 pub mod asr;
-
-#[cfg(feature = "sherpa")]
-pub mod kws;
 
 #[cfg(feature = "daemon")]
 pub mod daemon;

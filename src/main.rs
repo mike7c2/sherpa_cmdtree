@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -38,24 +38,6 @@ enum Cmd {
     /// Transcribe a WAV file with the native sherpa-onnx backend, and optionally
     /// parse it against a grammar (requires building with `--features sherpa`).
     Transcribe(TranscribeArgs),
-    /// Spot keywords in a WAV with a sherpa-onnx KWS model (wake/end-word check).
-    Spot(SpotArgs),
-}
-
-#[derive(clap::Args)]
-struct SpotArgs {
-    /// WAV file to scan (16 kHz mono PCM16)
-    #[arg(long)]
-    wav: PathBuf,
-    /// sherpa-onnx streaming KWS model dir (encoder/decoder/joiner ONNX + tokens.txt)
-    #[arg(long)]
-    kws_model: PathBuf,
-    /// tokenized keywords file; defaults to `<kws-model>/keywords.txt`
-    #[arg(long)]
-    keywords: Option<PathBuf>,
-    /// detection threshold in (0,1]; lower = more sensitive
-    #[arg(long, default_value_t = 0.25)]
-    threshold: f32,
 }
 
 #[derive(clap::Args)]
@@ -83,30 +65,11 @@ struct DaemonArgs {
     /// boost applied to auto-derived hotword phrases
     #[arg(long, default_value_t = 1.5)]
     bias_score: f32,
-    /// PTT: allow a trailing free-text slot to omit its end anchor (key-release ends
+    /// allow a trailing free-text slot to omit its end anchor (key-release ends
     /// the utterance), e.g. dictate a note without saying "full stop". The anchor
     /// stays in the grammar and is still honoured when spoken.
     #[arg(long)]
     open_ended: bool,
-    /// always-on wake-word mode: dir of a sherpa-onnx STREAMING KWS model (needs
-    /// --features sherpa). Coexists with the hotkey.
-    #[arg(long)]
-    wake_model: Option<PathBuf>,
-    /// tokenized keywords file for wake mode (defaults to <wake-model>/keywords.txt)
-    #[arg(long)]
-    keywords: Option<PathBuf>,
-    /// spotted phrase that ends a wake capture immediately (fast path), e.g. "GO"
-    #[arg(long)]
-    end_word: Option<String>,
-    /// KWS detection threshold in (0,1]; lower = more sensitive
-    #[arg(long, default_value_t = 0.25)]
-    wake_threshold: f32,
-    /// end a wake capture after this much trailing silence (seconds)
-    #[arg(long, default_value_t = 0.8)]
-    silence: f32,
-    /// hard cap on a single captured utterance (seconds)
-    #[arg(long, default_value_t = 8.0)]
-    max_utterance: f32,
 }
 
 #[derive(clap::Args)]
@@ -138,7 +101,7 @@ struct TranscribeArgs {
     tokens: bool,
 }
 
-fn load(grammar: &PathBuf) -> Result<Grammar, String> {
+fn load(grammar: &Path) -> Result<Grammar, String> {
     Grammar::load(grammar).map_err(|e| e.to_string())
 }
 
@@ -148,7 +111,6 @@ fn main() -> ExitCode {
         Cmd::Hotwords { grammar, score, out } => run_hotwords(grammar, score, out),
         Cmd::Daemon(args) => run_daemon(args),
         Cmd::Transcribe(args) => run_transcribe(args),
-        Cmd::Spot(args) => run_spot(args),
     };
     outcome.unwrap_or_else(|e| {
         eprintln!("error: {e}");
@@ -163,13 +125,8 @@ fn run_parse(grammar: PathBuf, text: String, json: bool) -> Result<ExitCode, Str
         return Ok(ExitCode::FAILURE);
     };
     if json {
-        let slots: serde_json::Map<String, serde_json::Value> = m
-            .slots
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect();
         let obj = serde_json::json!({
-            "command": m.command, "action": m.action, "slots": slots, "leftover": m.leftover,
+            "command": m.command, "action": m.action, "slots": m.slots_json(), "leftover": m.leftover,
         });
         println!("{}", serde_json::to_string_pretty(&obj).unwrap());
     } else {
@@ -215,12 +172,6 @@ fn run_daemon(args: DaemonArgs) -> Result<ExitCode, String> {
         bias: !args.no_bias,
         bias_score: args.bias_score,
         open_ended: args.open_ended,
-        wake_model: args.wake_model,
-        keywords: args.keywords,
-        end_word: args.end_word,
-        wake_threshold: args.wake_threshold,
-        silence_secs: args.silence,
-        max_utterance_secs: args.max_utterance,
     };
     cmdtree::daemon::run(load(&args.grammar)?, cfg)?;
     Ok(ExitCode::SUCCESS)
@@ -257,35 +208,6 @@ fn run_transcribe(args: TranscribeArgs) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(feature = "sherpa")]
-fn run_spot(args: SpotArgs) -> Result<ExitCode, String> {
-    let keywords = args
-        .keywords
-        .unwrap_or_else(|| args.kws_model.join("keywords.txt"));
-    let mut spotter = cmdtree::kws::KeywordSpotter::from_dir(
-        &args.kws_model,
-        cmdtree::kws::KwsOpts {
-            keywords_file: keywords,
-            threshold: args.threshold,
-            ..Default::default()
-        },
-    )?;
-    let (samples, sample_rate) = sherpa_rs::read_audio_file(&args.wav.to_string_lossy())
-        .map_err(|e| format!("reading {}: {e}", args.wav.display()))?;
-    // feed in 100 ms chunks, reporting hits with their approximate time
-    let chunk = (sample_rate / 10).max(1) as usize;
-    let mut hits = 0;
-    for (i, frame) in samples.chunks(chunk).enumerate() {
-        if let Some(kw) = spotter.accept(frame, sample_rate) {
-            let t = (i * chunk) as f32 / sample_rate as f32;
-            println!("{t:6.2}s  spotted: {kw:?}");
-            hits += 1;
-        }
-    }
-    eprintln!("{hits} keyword hit(s) in {}", args.wav.display());
-    Ok(ExitCode::SUCCESS)
-}
-
 #[cfg(not(feature = "daemon"))]
 fn run_daemon(_args: DaemonArgs) -> Result<ExitCode, String> {
     Err("the `daemon` subcommand needs the daemon feature (rebuild with --features daemon)".into())
@@ -294,9 +216,4 @@ fn run_daemon(_args: DaemonArgs) -> Result<ExitCode, String> {
 #[cfg(not(feature = "sherpa"))]
 fn run_transcribe(_args: TranscribeArgs) -> Result<ExitCode, String> {
     Err("the `transcribe` subcommand needs the sherpa feature (rebuild with --features sherpa)".into())
-}
-
-#[cfg(not(feature = "sherpa"))]
-fn run_spot(_args: SpotArgs) -> Result<ExitCode, String> {
-    Err("the `spot` subcommand needs the sherpa feature (rebuild with --features sherpa)".into())
 }

@@ -64,13 +64,26 @@ pub(crate) fn find_onnx(dir: &std::path::Path, keyword: &str) -> Result<String, 
         .ok_or_else(|| format!("no *{keyword}*.onnx in {}", dir.display()))
 }
 
+/// NUL-safe [`CString`] for FFI (an interior NUL yields an empty string rather
+/// than a panic). Shared by the transducer and KWS backends.
+pub(crate) fn cstr(s: &str) -> std::ffi::CString {
+    std::ffi::CString::new(s).unwrap_or_default()
+}
+
+/// Copy a possibly-null C string into an owned `String`.
+pub(crate) unsafe fn cstr_to_string(p: *const std::os::raw::c_char) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+    }
+}
+
 /// In-process sherpa-onnx offline transducer, driven directly through the C API
 /// (`sherpa-rs-sys`) so the full result — tokens + timestamps — is available.
 mod sherpa_backend {
-    use super::{AsrResult, AsrToken};
+    use super::{cstr, cstr_to_string, AsrResult, AsrToken};
     use sherpa_rs::sherpa_rs_sys as sys;
-    use std::ffi::{CStr, CString};
-    use std::os::raw::c_char;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -241,17 +254,4 @@ mod sherpa_backend {
         }
         AsrResult { text, tokens }
     }
-
-    fn cstr(s: &str) -> CString {
-        CString::new(s).unwrap_or_default()
-    }
-
-    unsafe fn cstr_to_string(p: *const c_char) -> String {
-        if p.is_null() {
-            String::new()
-        } else {
-            CStr::from_ptr(p).to_string_lossy().into_owned()
-        }
-    }
-
 }

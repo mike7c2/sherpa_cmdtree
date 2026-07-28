@@ -27,6 +27,14 @@ impl Match {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
+
+    /// The slot captures as a JSON object.
+    pub fn slots_json(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.slots
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect()
+    }
 }
 
 /// Options controlling how a transcript is matched.
@@ -69,12 +77,8 @@ fn word_eq(a: &str, b: &str, fuzzy: f64) -> bool {
     if fuzzy >= 1.0 {
         return false;
     }
-    let la = a.chars().count();
-    let lb = b.chars().count();
-    if la + lb == 0 {
-        return true;
-    }
-    let ratio = 2.0 * lcs_len(a, b) as f64 / (la + lb) as f64;
+    let len = a.chars().count() + b.chars().count(); // >= 1 since a != b
+    let ratio = 2.0 * lcs_len(a, b) as f64 / len as f64;
     ratio >= fuzzy
 }
 
@@ -129,15 +133,7 @@ fn match_command(cmd: &Command, words: &[String], fuzzy: f64, opts: ParseOpts) -
             Comp::Slot(name) => {
                 let anchor = &cmd.pattern[p + 1]; // guaranteed by validation
                 // free text is >= 1 word: search for the anchor from i+1 on
-                let mut found: Option<usize> = None;
-                let mut j = i + 1;
-                while j <= words.len() {
-                    if anchor_matches(anchor, words, j, fuzzy) {
-                        found = Some(j);
-                        break;
-                    }
-                    j += 1;
-                }
+                let found = (i + 1..=words.len()).find(|&j| anchor_matches(anchor, words, j, fuzzy));
                 match found {
                     Some(end) => {
                         slots.push((name.clone(), words[i..end].join(" ")));
@@ -183,19 +179,11 @@ impl Grammar {
     /// for a complete push-to-talk utterance).
     pub fn parse_with(&self, text: &str, opts: ParseOpts) -> Option<Match> {
         let words = normalize(text);
-        let mut best: Option<Match> = None;
-        for cmd in &self.commands {
-            if let Some(m) = match_command(cmd, &words, self.fuzzy, opts) {
-                let better = match &best {
-                    None => true,
-                    Some(b) => (m.score, b.leftover.len()) > (b.score, m.leftover.len()),
-                };
-                if better {
-                    best = Some(m);
-                }
-            }
-        }
-        best
+        let key = |m: &Match| (m.score, std::cmp::Reverse(m.leftover.len()));
+        self.commands
+            .iter()
+            .filter_map(|cmd| match_command(cmd, &words, self.fuzzy, opts))
+            .reduce(|best, m| if key(&m) > key(&best) { m } else { best })
     }
 }
 

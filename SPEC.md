@@ -1,11 +1,13 @@
 # cmdtree — Specification
 
-A lean, offline **voice command** recogniser: hold a hotkey, speak, and a transcript
-from a local sherpa-onnx model is matched against a YAML command tree. Free-text
-dictation is available as an explicit command. On-device, low-latency, no cloud, no LLM.
+A lean, offline **voice command** recogniser: hold a hotkey, speak, release, and a
+transcript from a local sherpa-onnx model is matched against a YAML command tree.
+Free-text dictation is available as an explicit command. On-device, **tiny latency**,
+no cloud, no LLM.
 
-Status: working end-to-end (offline push-to-talk). This spec locks the scope and the
-design decisions; anything under **Deferred** is out of scope until explicitly pulled in.
+Status: working end-to-end (pure push-to-talk; wake-word support was built, then
+removed — see §2). One planned change remains: cpal/ALSA → libpulse (§7). Anything
+under **Deferred** is out of scope until explicitly pulled in.
 
 ---
 
@@ -21,14 +23,22 @@ Three things, deliberately kept small:
 ## 2. Scope
 
 **In scope**
-- Offline **push-to-talk** (PTT): hold a global hotkey, speak one utterance, release.
+- **Pure push-to-talk**: press starts capture, release ends it and triggers recognition
+  immediately. The key is the only authority — no VAD, no silence thresholds, no
+  timeouts, no caps. Latency is a feature: release → NDJSON event ≈ decode time.
 - Deterministic grammar matching → a typed command (`name`, `action`, `slots`).
-- Exactly one style of free text: a **slot**, bounded by an end anchor (or by key-release in PTT).
+- Exactly one style of free text: a **slot**, bounded by an end anchor (or by
+  key-release when open-ended).
 - Tooling: grammar quality assessment, hotword generation, voice-data capture.
 
 **Out of scope (Non-goals)**
-- Streaming / always-on recognition as the engine (PTT only for now).
-- Wake-word (deferred — see §7).
+- **Wake-word support, in any form.** In-process KWS was built and removed; an external
+  trigger port (`start`/`stop` on stdin) was specced and rejected — both trade the
+  simplicity and latency of pure PTT for end-pointing machinery (VAD, timeouts, pre-roll).
+  Git history has both designs if the need ever really returns.
+- **Audio routing/sharing.** cmdtree opens one capture stream from the sound server;
+  anything fancier (fan-out, echo cancel, device juggling) is the server's job.
+- Streaming / always-on recognition as the engine.
 - LLM intent parsing; cloud services.
 - Automatic "unrecognised → dictation" fallback. Dictation is an **explicit** command.
 
@@ -45,20 +55,20 @@ no quality-linting code.
 | `grammar` | YAML command tree → compiled + validated form | core |
 | `parser` | match a transcript → `Match{command, action, slots, score, leftover}` | core |
 | `hotwords` | derive the sherpa hotword bias list from the grammar | core |
-| `wav`, `hotkey` | PCM16 WAV encode/resample; hotkey-combo parsing | core |
+| `wav`, `hotkey` | PCM16 WAV encode (for `--save-audio`); hotkey-combo parsing | core |
 | `asr` | `SherpaTransducer` (sherpa-onnx recognizer) → `AsrResult` | feature `sherpa` |
-| `kws` | streaming keyword spotter (wake / end word) | feature `sherpa` |
-| `daemon` | hotkey/wake-word capture → ASR → parse → emit | feature `daemon` |
+| `daemon` | hotkey-gated capture → ASR → parse → emit | feature `daemon` |
 
 `cmdtree-lint` modules (dev tool, depends on `cmdtree` for the grammar types):
 `phonetics` (espeak G2P + feature-weighted phone distance) and `assess` (confusability
 linter). Needs espeak at runtime; not part of the recognizer.
 
 **Cargo features (cmdtree):** `default = []` · `sherpa = [sherpa-rs]` ·
-`daemon = [cpal, evdev, sherpa]` (implies sherpa) · `sherpa-cuda = [sherpa, sherpa-rs/cuda]`.
-Core (grammar/parser/hotwords) builds with no native deps.
+`daemon = [audio, evdev, sherpa]` (implies sherpa; audio = cpal today, libpulse per §7) ·
+`sherpa-cuda = [sherpa, sherpa-rs/cuda]`. Core (grammar/parser/hotwords) builds with no
+native deps.
 
-**CLI:** `cmdtree` → `parse` · `hotwords` · `daemon` · `transcribe` · `spot`.
+**CLI:** `cmdtree` → `parse` · `hotwords` · `daemon` · `transcribe`.
 `cmdtree-lint <grammar> [--json]` → the quality report.
 
 ## 4. Command grammar
@@ -106,17 +116,23 @@ cmdtree daemon grammar.yaml --hotkey ctrl+space \
     [--no-bias] [--bias-score N]
 ```
 
+**Capture model.** The mic stream runs continuously; the hotkey gates it. Press starts
+buffering — including the frame the press landed in, so speech beginning with the press
+isn't clipped — and release hands the utterance straight to the recognizer. Hold and
+pause as long as you like.
+
 **stdout / stderr split (the integration contract).** cmdtree stays a recognizer and
 just *emits*; a separate executor acts (see §9). Per utterance:
 - **stdout** — exactly one **NDJSON** event (machine-readable, line-buffered):
   `{ts, command, action, slots, transcript}`. `command`/`action` are `null` and `slots`
   `{}` when nothing matched. This is the only thing on stdout — pipe it to an executor.
-- **stderr** — all human-readable diagnostics (`heard: …`, `words: w@t …`, the matched
-  command, startup/biasing/errors). Pipe/redirect separately.
+- **stderr** — all human-readable diagnostics: capture duration, `heard: …`,
+  `words: w@t …`, the matched command, startup/biasing/errors. Pipe/redirect separately.
 
 **`--save-audio DIR`** writes `utterance-<epoch_ms>.wav` (16 kHz mono) + appends
 `manifest.jsonl`: `{wav, epoch_ms, transcript, command, action, slots, words:[{w,t}]}` —
-the dataset for seeing which words work on the user's voice.
+the dataset for seeing which words work on the user's voice. The WAV stem, manifest
+`epoch_ms`, and event `ts` agree.
 
 ## 7. Constraints & prerequisites
 
@@ -125,15 +141,20 @@ the dataset for seeing which words work on the user's voice.
   model, distinct from the repo's TorchScript streaming model. `bpe.vocab` needed for biasing.
 - **Hotkey:** evdev reads `/dev/input` → works on X11 **and** Wayland, but needs
   membership in the `input` group.
-- **Audio:** cpal default input device, resampled to 16 kHz mono. No device picker yet.
+- **Audio (planned swap):** libpulse (`pa_simple`), requiring a PulseAudio-compatible
+  server (PipeWire's `pipewire-pulse`, or PulseAudio) — a given on both target boxes.
+  The server delivers 16 kHz mono f32 directly (no client-side resampling/downmix) and
+  small fragments are requested to keep capture latency low. Until the swap: cpal
+  default device + in-process resampling.
 - **espeak** required by `cmdtree-lint` only (predictive proxy; not a runtime dep).
-- **Latency (offline, model resident):** decode ≈ 20 ms for a short command; one-time model
-  load ≈ 2 s at daemon start.
+- **Latency budget (the core goal):** press → capture is immediate (the stream never
+  stops; the press frame is included). Release → NDJSON event ≈ offline decode ≈ 20 ms
+  for a short command, model resident. Model load ≈ 2 s once at daemon start.
 
 ## 8. Quality bar
 
-`cargo test` (core) + `cargo test --features daemon,sherpa` green (currently 21 tests);
-`cargo clippy` clean across all feature combos; `cargo package --list` clean.
+`cargo test` green (core and `--features daemon`); `cargo clippy` clean across all feature
+combos; `cargo package --list` clean.
 
 ## 9. Deferred (out of scope until pulled in)
 
@@ -142,9 +163,7 @@ the dataset for seeing which words work on the user's voice.
   custom scripts). cmdtree never grows built-in integrations; `action`+`slots` is the contract.
   Optional extra-hotwords list (names/jargon, e.g. "Tuvok") merged with the grammar-derived
   bias list is the one biasing add still worth doing.
-- **Wake-word:** a small **streaming** keyword-spotter in front → hand off to this offline
-  recogniser. Streaming would require the sys online recognizer.
-- Mic `--device` selector.
+- `--source NAME` pulse source selector (trivial via `pa_simple`; add when needed).
 - Surfacing `Match.score` as a confidence readout / manifest field.
 - Fine-tuning the transducer on the user's voice (uses the `--save-audio` corpus).
 - CUDA execution provider (`sherpa-cuda`) — not needed for command latency.
