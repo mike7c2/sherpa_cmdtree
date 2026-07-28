@@ -40,6 +40,30 @@ impl AsrResult {
 
 pub use sherpa_backend::{SherpaOpts, SherpaTransducer};
 
+/// Find the single `*keyword*.onnx` file in `dir`, preferring a full-precision build
+/// over an `int8` one when both exist. Shared by the transducer and KWS backends.
+pub(crate) fn find_onnx(dir: &std::path::Path, keyword: &str) -> Result<String, String> {
+    let mut matches: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            name.contains(keyword) && name.ends_with(".onnx")
+        })
+        .collect();
+    matches.sort(); // deterministic order first ...
+    matches.sort_by_key(|p| p.to_string_lossy().contains("int8")); // ... full-precision before int8
+    matches
+        .into_iter()
+        .next()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("no *{keyword}*.onnx in {}", dir.display()))
+}
+
 /// In-process sherpa-onnx offline transducer, driven directly through the C API
 /// (`sherpa-rs-sys`) so the full result — tokens + timestamps — is available.
 mod sherpa_backend {
@@ -116,9 +140,9 @@ mod sherpa_backend {
 
             // Every CString must outlive SherpaOnnxCreateOfflineRecognizer (sherpa
             // copies the strings during create), so bind them all here first.
-            let encoder = cstr(&find_model_file(dir, "encoder")?);
-            let decoder = cstr(&find_model_file(dir, "decoder")?);
-            let joiner = cstr(&find_model_file(dir, "joiner")?);
+            let encoder = cstr(&super::find_onnx(dir, "encoder")?);
+            let decoder = cstr(&super::find_onnx(dir, "decoder")?);
+            let joiner = cstr(&super::find_onnx(dir, "joiner")?);
             let tokens_c = cstr(&tokens.to_string_lossy());
             let provider = cstr(opts.provider.as_deref().unwrap_or("cpu"));
             let model_type = cstr("transducer");
@@ -230,27 +254,4 @@ mod sherpa_backend {
         }
     }
 
-    /// Find the single `*keyword*.onnx` file in `dir`, preferring a full-precision
-    /// build over an `int8` one when both exist.
-    fn find_model_file(dir: &Path, keyword: &str) -> Result<String, String> {
-        let mut matches: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                let name = p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                name.contains(keyword) && name.ends_with(".onnx")
-            })
-            .collect();
-        matches.sort(); // deterministic order first ...
-        matches.sort_by_key(|p| p.to_string_lossy().contains("int8")); // ... full-precision before int8
-        matches
-            .into_iter()
-            .next()
-            .map(|p| p.to_string_lossy().into_owned())
-            .ok_or_else(|| format!("no *{keyword}*.onnx model file in {}", dir.display()))
-    }
 }

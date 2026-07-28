@@ -68,9 +68,9 @@ impl KeywordSpotter {
         }
 
         // Bind every CString until after create returns (sherpa copies them).
-        let encoder = cstr(&find_onnx(dir, "encoder")?);
-        let decoder = cstr(&find_onnx(dir, "decoder")?);
-        let joiner = cstr(&find_onnx(dir, "joiner")?);
+        let encoder = cstr(&crate::asr::find_onnx(dir, "encoder")?);
+        let decoder = cstr(&crate::asr::find_onnx(dir, "decoder")?);
+        let joiner = cstr(&crate::asr::find_onnx(dir, "joiner")?);
         let tokens_c = cstr(&tokens.to_string_lossy());
         let keywords_c = cstr(&opts.keywords_file.to_string_lossy());
         let provider = cstr(opts.provider.as_deref().unwrap_or("cpu"));
@@ -150,27 +150,4 @@ unsafe fn cstr_to_string(p: *const c_char) -> String {
     } else {
         CStr::from_ptr(p).to_string_lossy().into_owned()
     }
-}
-
-/// Find the single `*keyword*.onnx` file in `dir`, preferring full-precision over int8.
-fn find_onnx(dir: &Path, keyword: &str) -> Result<String, String> {
-    let mut matches: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            name.contains(keyword) && name.ends_with(".onnx")
-        })
-        .collect();
-    matches.sort();
-    matches.sort_by_key(|p| p.to_string_lossy().contains("int8"));
-    matches
-        .into_iter()
-        .next()
-        .map(|p| p.to_string_lossy().into_owned())
-        .ok_or_else(|| format!("no *{keyword}*.onnx in {}", dir.display()))
 }
