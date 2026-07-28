@@ -42,7 +42,20 @@ pub struct DaemonConfig {
     /// PTT: let a trailing free-text slot omit its end anchor (the key-release bounds
     /// the utterance). The anchor stays in the grammar and is still used when spoken.
     pub open_ended: bool,
-    pub sample_rate: u32,
+    /// always-on wake-word mode: dir of a sherpa-onnx **streaming** KWS model (needs
+    /// feature `sherpa`). Coexists with the hotkey.
+    pub wake_model: Option<PathBuf>,
+    /// tokenized keywords file; defaults to `<wake_model>/keywords.txt`.
+    pub keywords: Option<PathBuf>,
+    /// a spotted phrase that ends capture immediately (fast path); otherwise capture
+    /// ends on trailing silence or the max-duration cap.
+    pub end_word: Option<String>,
+    /// KWS detection threshold in (0,1]; lower = more sensitive.
+    pub wake_threshold: f32,
+    /// end a wake capture after this much trailing silence (seconds).
+    pub silence_secs: f32,
+    /// hard cap on a single captured utterance (seconds).
+    pub max_utterance_secs: f32,
 }
 
 /// Milliseconds since the Unix epoch.
@@ -249,17 +262,14 @@ fn open_keyboards() -> Result<Vec<evdev::Device>, String> {
     Ok(keyboards)
 }
 
-/// Read key events from one device forever, maintaining the shared `pressed` set
-/// and driving the record/stop transition when the combo becomes (un)satisfied.
-/// One of these runs per keyboard so a modifier and key on different devices still
-/// combine. The `pressed` lock serializes transitions across devices.
+/// Read key events from one device forever, maintaining the shared `pressed` set and
+/// setting `ptt_held` to whether the combo is currently satisfied. One of these runs
+/// per keyboard so a modifier and key on different devices still combine.
 fn monitor_device(
     mut dev: evdev::Device,
     combo: Combo,
     pressed: Arc<Mutex<HashSet<String>>>,
-    recording: Arc<AtomicBool>,
-    buffer: Arc<Mutex<Vec<f32>>>,
-    tx: mpsc::Sender<Vec<f32>>,
+    ptt_held: Arc<AtomicBool>,
 ) {
     loop {
         let events = match dev.fetch_events() {
@@ -284,17 +294,7 @@ fn monitor_device(
                 } // press
                 _ => continue, // 2 = autorepeat
             }
-            let now = combo.is_satisfied(&p);
-            let was = recording.load(Ordering::SeqCst);
-            if now && !was {
-                buffer.lock().unwrap().clear();
-                recording.store(true, Ordering::SeqCst);
-                eprintln!("🎤 listening…");
-            } else if !now && was {
-                recording.store(false, Ordering::SeqCst);
-                let samples = buffer.lock().unwrap().clone();
-                let _ = tx.send(samples);
-            }
+            ptt_held.store(combo.is_satisfied(&p), Ordering::SeqCst);
         }
     }
 }
@@ -309,11 +309,10 @@ fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Build a continuously-running input stream that appends mono f32 to `buffer`
-/// whenever `recording` is true. Returns the stream (keep alive) and its rate.
+/// Build a continuously-running input stream that sends every captured mono f32
+/// frame to `frame_tx`. Returns the stream (keep alive) and its sample rate.
 fn build_input_stream(
-    recording: Arc<AtomicBool>,
-    buffer: Arc<Mutex<Vec<f32>>>,
+    frame_tx: mpsc::Sender<Vec<f32>>,
 ) -> Result<(cpal::Stream, u32), String> {
     let host = cpal::default_host();
     let device = host
@@ -329,13 +328,10 @@ fn build_input_stream(
 
     macro_rules! push {
         ($to_f32:expr) => {{
-            let rec = recording.clone();
-            let buf = buffer.clone();
+            let tx = frame_tx.clone();
             move |data: &[_], _: &cpal::InputCallbackInfo| {
-                if rec.load(Ordering::SeqCst) {
-                    let f: Vec<f32> = data.iter().map(|&s| $to_f32(s)).collect();
-                    buf.lock().unwrap().extend_from_slice(&downmix(&f, channels));
-                }
+                let f: Vec<f32> = data.iter().map(|&s| $to_f32(s)).collect();
+                let _ = tx.send(downmix(&f, channels));
             }
         }};
     }
@@ -364,6 +360,84 @@ fn build_input_stream(
     .map_err(|e| e.to_string())?;
 
     Ok((stream, sample_rate))
+}
+
+/// Capture state over the continuous frame stream.
+enum Capture {
+    Idle,
+    /// capturing because the hotkey is held (stops on release).
+    Ptt,
+    /// capturing because a wake word fired (stops on end word / silence / max).
+    Wake { silence: usize, heard: bool },
+}
+
+/// The keyword spotter type — only real with feature `sherpa`; an uninhabited stand-in
+/// otherwise, so the capture loop compiles either way (wake mode just can't be entered).
+#[cfg(feature = "sherpa")]
+type Kws = crate::kws::KeywordSpotter;
+#[cfg(not(feature = "sherpa"))]
+enum Kws {}
+
+#[cfg(feature = "sherpa")]
+fn kws_accept(kws: &mut Option<Kws>, frame: &[f32]) -> Option<String> {
+    kws.as_mut().and_then(|k| k.accept(frame, 16_000))
+}
+#[cfg(not(feature = "sherpa"))]
+fn kws_accept(_kws: &mut Option<Kws>, _frame: &[f32]) -> Option<String> {
+    None
+}
+
+fn rms(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt()
+}
+
+fn is_end_word(kw: &str, end_word: &Option<String>) -> bool {
+    end_word.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(kw))
+}
+
+/// Recognise one captured utterance (16 kHz mono): diagnostics to stderr, the NDJSON
+/// intent to stdout, and an optional saved snippet.
+fn process_utterance(
+    samples: &[f32],
+    recognizer: &dyn Recognizer,
+    grammar: &Grammar,
+    open_ended: bool,
+    save_audio: Option<&std::path::Path>,
+) {
+    match recognizer.recognize(samples, 16_000) {
+        Ok(res) => {
+            eprintln!("heard: {:?}", res.text);
+            let words = res.words();
+            if !words.is_empty() {
+                let line: Vec<String> = words.iter().map(|(w, t)| format!("{w}@{t:.2}")).collect();
+                eprintln!("  words: {}", line.join(" "));
+            }
+            let m = grammar.parse_with(&res.text, crate::parser::ParseOpts { open_ended });
+            match &m {
+                Some(cmd) => {
+                    let slots: Vec<String> =
+                        cmd.slots.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
+                    eprintln!(
+                        "  → {}{}  [{}]",
+                        cmd.command,
+                        cmd.action.as_ref().map(|a| format!(" ({a})")).unwrap_or_default(),
+                        slots.join(", ")
+                    );
+                }
+                None => eprintln!("  → (no command recognised)"),
+            }
+            println!("{}", event_json(&res.text, m.as_ref(), epoch_ms()));
+            if let Some(dir) = save_audio {
+                if let Err(e) = save_snippet(dir, samples, 16_000, &res.text, m.as_ref(), &words) {
+                    eprintln!("could not save audio snippet: {e}");
+                }
+            }
+        }
+        Err(e) => eprintln!("asr error: {e}"),
+    }
 }
 
 pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
@@ -400,15 +474,52 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
         );
     }
 
-    let recording = Arc::new(AtomicBool::new(false));
-    let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let (stream, in_rate) = build_input_stream(recording.clone(), buffer.clone())?;
+    // Optional always-on wake-word front-end (needs feature `sherpa`).
+    #[cfg(feature = "sherpa")]
+    let mut kws: Option<Kws> = match &cfg.wake_model {
+        Some(dir) => {
+            let keywords = cfg
+                .keywords
+                .clone()
+                .unwrap_or_else(|| dir.join("keywords.txt"));
+            let spotter = crate::kws::KeywordSpotter::from_dir(
+                dir,
+                crate::kws::KwsOpts {
+                    keywords_file: keywords,
+                    threshold: cfg.wake_threshold,
+                    ..Default::default()
+                },
+            )?;
+            eprintln!(
+                "wake-word mode on (threshold {}{})",
+                cfg.wake_threshold,
+                cfg.end_word
+                    .as_deref()
+                    .map(|e| format!(", end word {e:?}"))
+                    .unwrap_or_default()
+            );
+            Some(spotter)
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "sherpa"))]
+    let mut kws: Option<Kws> = {
+        if cfg.wake_model.is_some() {
+            return Err("--wake-model needs the `sherpa` feature \
+                 (rebuild: cargo build --features daemon,sherpa)"
+                .to_string());
+        }
+        None
+    };
+
+    // Continuous mic → frames.
+    let (frame_tx, frame_rx) = mpsc::channel::<Vec<f32>>();
+    let (stream, in_rate) = build_input_stream(frame_tx)?;
     stream.play().map_err(|e| e.to_string())?;
 
-    let (tx, rx) = mpsc::channel::<Vec<f32>>();
-
-    // hotkey monitoring: evdev reads /dev/input directly, so it works on X11 and
-    // Wayland alike. One thread per keyboard, all sharing the `pressed` set.
+    // hotkey monitoring: evdev reads /dev/input directly (X11 + Wayland). One thread
+    // per keyboard, all sharing the `pressed` set; they set `ptt_held`.
+    let ptt_held = Arc::new(AtomicBool::new(false));
     let keyboards = open_keyboards()?;
     eprintln!(
         "monitoring {} keyboard device(s) for [{}]",
@@ -419,72 +530,103 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
     for dev in keyboards {
         let combo = combo.clone();
         let pressed = pressed.clone();
-        let recording = recording.clone();
-        let buffer = buffer.clone();
-        let tx = tx.clone();
-        std::thread::spawn(move || monitor_device(dev, combo, pressed, recording, buffer, tx));
+        let ptt_held = ptt_held.clone();
+        std::thread::spawn(move || monitor_device(dev, combo, pressed, ptt_held));
     }
-    // The monitor threads hold their own senders; drop ours so the loop below only
-    // ends if every keyboard monitor exits.
-    drop(tx);
 
-    // stdout carries ONE NDJSON event per utterance (machine-readable, for a
-    // downstream executor); everything human-readable goes to stderr, so the two
-    // can be piped apart.
-    eprintln!(
-        "cmdtree daemon ready. Hold [{}] and speak; release to recognise. Ctrl-C to quit.",
-        cfg.hotkey
-    );
+    // stdout carries ONE NDJSON event per utterance (for a downstream executor);
+    // everything human-readable goes to stderr, so the two can be piped apart.
+    if cfg.wake_model.is_some() {
+        eprintln!(
+            "cmdtree daemon ready. Say a wake word, or hold [{}]. Ctrl-C to quit.",
+            cfg.hotkey
+        );
+    } else {
+        eprintln!(
+            "cmdtree daemon ready. Hold [{}] and speak; release to recognise. Ctrl-C to quit.",
+            cfg.hotkey
+        );
+    }
 
-    for samples in rx {
-        if samples.is_empty() {
+    // Unified capture loop over the 16 kHz frame stream. PTT and wake both feed it.
+    const SILENCE_RMS: f32 = 0.015;
+    const END_WORD_TRIM_S: f32 = 0.5; // drop the trailing end-word audio from the command
+    let secs = |n: usize| n as f32 / 16_000.0;
+    let mut cmd = Vec::<f32>::new();
+    let mut state = Capture::Idle;
+    for raw in frame_rx {
+        if raw.is_empty() {
             continue;
         }
-        let resampled = wav::resample_linear(&samples, in_rate, cfg.sample_rate);
-        let (transcript, matched, words) = match recognizer.recognize(&resampled, cfg.sample_rate) {
-            Ok(res) => {
-                eprintln!("heard: {:?}", res.text);
-                let words = res.words();
-                if !words.is_empty() {
-                    let line: Vec<String> =
-                        words.iter().map(|(w, t)| format!("{w}@{t:.2}")).collect();
-                    eprintln!("  words: {}", line.join(" "));
-                }
-                let m = grammar
-                    .parse_with(&res.text, crate::parser::ParseOpts { open_ended: cfg.open_ended });
-                match &m {
-                    Some(m) => {
-                        let slots: Vec<String> =
-                            m.slots.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
-                        eprintln!(
-                            "  → {}{}  [{}]",
-                            m.command,
-                            m.action.as_ref().map(|a| format!(" ({a})")).unwrap_or_default(),
-                            slots.join(", ")
-                        );
+        let frame = wav::resample_linear(&raw, in_rate, 16_000);
+        let ptt = ptt_held.load(Ordering::SeqCst);
+        match &mut state {
+            Capture::Idle => {
+                if ptt {
+                    cmd.clear();
+                    cmd.extend_from_slice(&frame);
+                    eprintln!("🎤 listening… (ptt)");
+                    state = Capture::Ptt;
+                } else if let Some(kw) = kws_accept(&mut kws, &frame) {
+                    if !is_end_word(&kw, &cfg.end_word) {
+                        eprintln!("🔔 wake: {kw:?}");
+                        cmd.clear();
+                        state = Capture::Wake {
+                            silence: 0,
+                            heard: false,
+                        };
                     }
-                    None => eprintln!("  → (no command recognised)"),
                 }
-                // machine-readable intent → stdout (NDJSON). stdout is line-buffered,
-                // so each event flushes on its newline.
-                println!("{}", event_json(&res.text, m.as_ref(), epoch_ms()));
-                (res.text, m, words)
             }
-            Err(e) => {
-                eprintln!("asr error: {e}");
-                (String::new(), None, Vec::new())
+            Capture::Ptt => {
+                cmd.extend_from_slice(&frame);
+                if !ptt {
+                    process_utterance(
+                        &cmd,
+                        recognizer.as_ref(),
+                        &grammar,
+                        cfg.open_ended,
+                        cfg.save_audio.as_deref(),
+                    );
+                    cmd.clear();
+                    state = Capture::Idle;
+                }
             }
-        };
-        if let Some(dir) = &cfg.save_audio {
-            if let Err(e) = save_snippet(
-                dir,
-                &resampled,
-                cfg.sample_rate,
-                &transcript,
-                matched.as_ref(),
-                &words,
-            ) {
-                eprintln!("could not save audio snippet: {e}");
+            Capture::Wake { silence, heard } => {
+                cmd.extend_from_slice(&frame);
+                let mut stop = false;
+                let mut trim = 0usize;
+                if let Some(kw) = kws_accept(&mut kws, &frame) {
+                    if is_end_word(&kw, &cfg.end_word) {
+                        eprintln!("🔚 end: {kw:?}");
+                        stop = true;
+                        trim = (END_WORD_TRIM_S * 16_000.0) as usize;
+                    }
+                }
+                if rms(&frame) >= SILENCE_RMS {
+                    *heard = true;
+                    *silence = 0;
+                } else {
+                    *silence += frame.len();
+                }
+                if *heard && secs(*silence) >= cfg.silence_secs {
+                    stop = true;
+                }
+                if secs(cmd.len()) >= cfg.max_utterance_secs {
+                    stop = true;
+                }
+                if stop {
+                    let end = cmd.len().saturating_sub(trim);
+                    process_utterance(
+                        &cmd[..end],
+                        recognizer.as_ref(),
+                        &grammar,
+                        cfg.open_ended,
+                        cfg.save_audio.as_deref(),
+                    );
+                    cmd.clear();
+                    state = Capture::Idle;
+                }
             }
         }
     }

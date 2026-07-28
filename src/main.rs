@@ -102,9 +102,25 @@ struct DaemonArgs {
     /// stays in the grammar and is still honoured when spoken.
     #[arg(long)]
     open_ended: bool,
-    /// mic sample rate
-    #[arg(long, default_value_t = 16000)]
-    sample_rate: u32,
+    /// always-on wake-word mode: dir of a sherpa-onnx STREAMING KWS model (needs
+    /// --features sherpa). Coexists with the hotkey.
+    #[arg(long)]
+    wake_model: Option<PathBuf>,
+    /// tokenized keywords file for wake mode (defaults to <wake-model>/keywords.txt)
+    #[arg(long)]
+    keywords: Option<PathBuf>,
+    /// spotted phrase that ends a wake capture immediately (fast path), e.g. "GO"
+    #[arg(long)]
+    end_word: Option<String>,
+    /// KWS detection threshold in (0,1]; lower = more sensitive
+    #[arg(long, default_value_t = 0.25)]
+    wake_threshold: f32,
+    /// end a wake capture after this much trailing silence (seconds)
+    #[arg(long, default_value_t = 0.8)]
+    silence: f32,
+    /// hard cap on a single captured utterance (seconds)
+    #[arg(long, default_value_t = 8.0)]
+    max_utterance: f32,
 }
 
 #[derive(clap::Args)]
@@ -252,7 +268,12 @@ fn run_daemon(args: DaemonArgs) -> ExitCode {
         bias: !args.no_bias,
         bias_score: args.bias_score,
         open_ended: args.open_ended,
-        sample_rate: args.sample_rate,
+        wake_model: args.wake_model,
+        keywords: args.keywords,
+        end_word: args.end_word,
+        wake_threshold: args.wake_threshold,
+        silence_secs: args.silence,
+        max_utterance_secs: args.max_utterance,
     };
     match cmdtree::daemon::run(g, cfg) {
         Ok(()) => ExitCode::SUCCESS,
