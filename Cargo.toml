@@ -1,9 +1,13 @@
+[workspace]
+members = ["lint"]
+resolver = "2"
+
 [package]
 name = "cmdtree"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
-description = "Voice command-tree grammar with free-text slots: YAML grammar, parser, phonetic quality assessment, and an optional push-to-talk daemon."
+description = "Voice command-tree grammar with free-text slots: YAML grammar, parser, and an optional wake-word / push-to-talk daemon over sherpa-onnx."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mike7c2/cmdtree"
 readme = "README.md"

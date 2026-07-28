@@ -2,17 +2,18 @@
 //!
 //! * [`grammar`] — the YAML-backed command tree (raw types + compilation/validation).
 //! * [`parser`] — match a transcript against the tree, extracting slot values.
-//! * [`phonetics`] — espeak G2P + distinctive-feature-weighted phonetic distance.
-//! * [`assess`]   — predict how reliably an ASR will pick up a given command tree.
+//! * [`hotwords`] — derive a sherpa-onnx bias list from a grammar.
 //! * `asr` (feature `daemon` or `sherpa`) — ASR backends: external command + native sherpa-onnx.
-//! * `daemon` (feature `daemon`) — push-to-talk: hotkey + mic capture + ASR + parse.
+//! * `kws` (feature `sherpa`) — streaming keyword spotter (wake / end word).
+//! * `daemon` (feature `daemon`) — hotkey/wake-word capture + ASR + parse + emit.
+//!
+//! Grammar-quality linting (`assess`/`phonetics`) lives in the separate
+//! `cmdtree-lint` crate, so the runtime recognizer stays minimal.
 
-pub mod assess;
 pub mod grammar;
 pub mod hotkey;
 pub mod hotwords;
 pub mod parser;
-pub mod phonetics;
 pub mod wav;
 
 #[cfg(any(feature = "daemon", feature = "sherpa"))]

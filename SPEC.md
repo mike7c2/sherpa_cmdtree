@@ -34,24 +34,32 @@ Three things, deliberately kept small:
 
 ## 3. Architecture
 
-Rust crate `cmdtree` (lib + `cmdtree` CLI). Modules:
+A Cargo **workspace**: the recognizer crate `cmdtree` (lib + `cmdtree` CLI) and a
+separate grammar-authoring crate `cmdtree-lint` (`lint/`). The runtime crate carries
+no quality-linting code.
+
+`cmdtree` modules:
 
 | Module | Responsibility | Deps |
 |---|---|---|
 | `grammar` | YAML command tree → compiled + validated form | core |
 | `parser` | match a transcript → `Match{command, action, slots, score, leftover}` | core |
-| `phonetics` | espeak G2P + distinctive-feature-weighted phone distance | espeak (runtime) |
-| `assess` | predict ASR reliability of a grammar (confusability linter) | core |
 | `hotwords` | derive the sherpa hotword bias list from the grammar | core |
 | `wav`, `hotkey` | PCM16 WAV encode/resample; hotkey-combo parsing | core |
 | `asr` | `Recognizer` trait + backends (see §5) | feature `daemon`/`sherpa` |
-| `daemon` | evdev hotkey → cpal mic → ASR → parse → act/log | feature `daemon` |
+| `kws` | streaming keyword spotter (wake / end word) | feature `sherpa` |
+| `daemon` | hotkey/wake-word capture → ASR → parse → emit | feature `daemon` |
 
-**Cargo features:** `default = []` · `daemon = [cpal, evdev]` · `sherpa = [sherpa-rs]` ·
-`sherpa-cuda = [sherpa, sherpa-rs/cuda]`. Core (grammar/parser/assess/hotwords) builds
-with no native deps.
+`cmdtree-lint` modules (dev tool, depends on `cmdtree` for the grammar types):
+`phonetics` (espeak G2P + feature-weighted phone distance) and `assess` (confusability
+linter). Needs espeak at runtime; not part of the recognizer.
 
-**CLI:** `assess` · `parse` · `hotwords` · `daemon` · `transcribe`.
+**Cargo features (cmdtree):** `default = []` · `daemon = [cpal, evdev]` ·
+`sherpa = [sherpa-rs]` · `sherpa-cuda = [sherpa, sherpa-rs/cuda]`. Core
+(grammar/parser/hotwords) builds with no native deps.
+
+**CLI:** `cmdtree` → `parse` · `hotwords` · `daemon` · `transcribe` · `spot`.
+`cmdtree-lint <grammar> [--json]` → the quality report.
 
 ## 4. Command grammar
 
@@ -62,7 +70,7 @@ captured slot), `{slot: name}` (free text). Rules:
   so free text is bounded on both sides. This keeps the matcher stateless.
 - **Design idiom for low confusability:** factor a shared enum suffix into a literal
   (`{one_of: [two,five,ten]} {lit: minutes}`, not options `"five minutes"…`). Verified
-  with `assess`; the shipped `grammar.yaml` scores ≥98/100 with zero confusable pairs.
+  with `cmdtree-lint`; the shipped `grammar.yaml` scores ≥98/100 with zero confusable pairs.
 
 `grammar.yaml` is the reference tree (11 commands: light_power, brightness, scene, volume,
 play_music, pause, timer, weather, navigate, phone, dictate_note).
@@ -117,7 +125,7 @@ the dataset for seeing which words work on the user's voice.
 - **Hotkey:** evdev reads `/dev/input` → works on X11 **and** Wayland, but needs
   membership in the `input` group.
 - **Audio:** cpal default input device, resampled to 16 kHz mono. No device picker yet.
-- **espeak** required for `assess`/`phonetics` (predictive proxy only).
+- **espeak** required by `cmdtree-lint` only (predictive proxy; not a runtime dep).
 - **Latency (offline, model resident):** decode ≈ 20 ms for a short command; one-time model
   load ≈ 2 s at daemon start.
 

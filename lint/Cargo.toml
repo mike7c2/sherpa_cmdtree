@@ -1,0 +1,22 @@
+[package]
+name = "cmdtree-lint"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Grammar-quality linter for cmdtree: predicts ASR confusability of a command tree using feature-weighted espeak phonetics."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mike7c2/cmdtree"
+
+[dependencies]
+cmdtree = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "cmdtree-lint"
+path = "src/main.rs"
+
+[lib]
+name = "cmdtree_lint"
+path = "src/lib.rs"

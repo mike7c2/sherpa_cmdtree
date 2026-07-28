@@ -7,7 +7,8 @@
 
 use serde::Serialize;
 
-use crate::grammar::{Command, Comp, Grammar};
+use cmdtree::grammar::{Command, Comp, Grammar};
+
 use crate::phonetics::{available, distance, ipa, phone_count};
 
 /// distances below this are "confusable"; below CLOSE are "somewhat close".
@@ -259,7 +260,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::Grammar;
+    use cmdtree::grammar::Grammar;
 
     #[test]
     fn flags_common_anchor_and_confusable_enum() {

@@ -4,3 +4,6 @@
 # editor / OS cruft
 *.swp
 .DS_Store
+
+# local wake-word keyword file
+wake.txt

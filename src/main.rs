@@ -3,7 +3,6 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use cmdtree::assess::assess;
 use cmdtree::grammar::Grammar;
 
 #[derive(Parser)]
@@ -15,14 +14,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Assess how reliably an ASR should pick up a command tree.
-    Assess {
-        /// path to the YAML grammar
-        grammar: PathBuf,
-        /// emit JSON instead of a text report
-        #[arg(long)]
-        json: bool,
-    },
     /// Parse a transcript against the grammar and print the matched command.
     Parse {
         grammar: PathBuf,
@@ -159,22 +150,6 @@ fn load(grammar: &PathBuf) -> Result<Grammar, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Assess { grammar, json } => {
-            let g = match load(&grammar) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let report = assess(&g);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                println!("{}", report.render());
-            }
-            ExitCode::SUCCESS
-        }
         Cmd::Parse { grammar, text, json } => {
             let g = match load(&grammar) {
                 Ok(g) => g,

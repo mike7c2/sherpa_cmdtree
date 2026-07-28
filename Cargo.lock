@@ -321,6 +321,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmdtree-lint"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cmdtree",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

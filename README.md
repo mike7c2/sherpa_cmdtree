@@ -10,23 +10,33 @@ acoustic confusability.
 
 ## Layout
 
+A Cargo workspace: the `cmdtree` recognizer crate, and a separate `cmdtree-lint`
+crate (`lint/`) for grammar-quality authoring — so the runtime stays minimal.
+
+**`cmdtree`** (the recognizer):
+
 | Module | What |
 |---|---|
 | `grammar` | YAML command tree → compiled + validated form |
-| `parser`  | match a transcript → `{command, slots, leftover}` |
-| `phonetics` | espeak G2P + **distinctive-feature-weighted** phonetic distance |
-| `assess`  | predict recognition reliability of a grammar |
-| `wav`, `hotkey` | PCM16 WAV encoder + hotkey-combo parsing (pure, unit-tested) |
-| `daemon` *(feature)* | hold-a-hotkey → capture mic → ASR → parse |
+| `parser`  | match a transcript → `{command, action, slots, leftover}` |
+| `hotwords` | derive a sherpa-onnx bias list from the grammar |
+| `wav`, `hotkey` | PCM16 WAV encode/resample + hotkey-combo parsing (pure, unit-tested) |
+| `asr` *(feature)* | `Recognizer` trait + external-command / sherpa-onnx backends |
+| `kws` *(feature `sherpa`)* | streaming keyword spotter (wake / end word) |
+| `daemon` *(feature)* | hotkey or wake-word capture → ASR → parse → emit NDJSON |
+
+**`cmdtree-lint`** (dev tool): `phonetics` (espeak G2P + feature-weighted distance) and
+`assess` (confusability linter). Run it on a grammar; not part of the runtime.
 
 ## Build & test
 
 ```bash
-cargo test                       # core: grammar, parser, phonetics, assess (no native deps)
-cargo build --release            # the `cmdtree` CLI (assess/parse)
+cargo test                       # core: grammar, parser, hotwords (no native deps)
+cargo build --release            # the `cmdtree` CLI (parse/hotwords)
 cargo build --release --features daemon          # + push-to-talk daemon (mic + hotkey)
-cargo build --release --features sherpa          # + native sherpa-onnx ASR & `transcribe`
-cargo build --release --features daemon,sherpa   # daemon using the in-process recognizer
+cargo build --release --features sherpa          # + native sherpa-onnx ASR, transcribe, spot
+cargo build --release --features daemon,sherpa   # daemon + in-process recognizer + wake word
+cargo run -p cmdtree-lint -- grammar.yaml        # grammar-quality report (needs espeak)
 ```
 
 Features are additive: `daemon` links mic capture (cpal) and the evdev hotkey;
@@ -62,7 +72,7 @@ validated at load time.
 ## CLI
 
 ```bash
-cmdtree assess grammar.example.yaml            # quality report (add --json)
+cargo run -p cmdtree-lint -- grammar.example.yaml   # grammar-quality report (add --json)
 cmdtree parse  grammar.example.yaml --text "turn off the kitchen light"
 
 # push-to-talk, external ASR (the Python transducer in this repo):
@@ -77,7 +87,7 @@ cmdtree transcribe --wav utterance.wav --sherpa-model models/onnx-zipformer-en \
         --grammar grammar.example.yaml
 ```
 
-`assess` scores each command on phonetic confusability (feature-weighted, so a
+`cmdtree-lint` scores each command on phonetic confusability (feature-weighted, so a
 voicing-only difference counts as *closer* than a manner/vowel difference — per
 Miller & Nicely), plus anchor length/commonness. It is a **predictive proxy**;
 for ground truth, synthesize each command and run it back through your recogniser.
