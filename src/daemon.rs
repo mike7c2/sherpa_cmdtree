@@ -1,12 +1,12 @@
-//! Push-to-talk daemon: hold a global hotkey, capture the mic, transcribe, parse.
+//! Voice daemon: capture the mic via push-to-talk or a wake word, recognise with
+//! the in-process sherpa-onnx transducer, parse against the grammar, and emit one
+//! NDJSON intent per utterance on stdout (diagnostics on stderr).
 //!
-//! Feature-gated (`--features daemon`) because it links native audio (cpal/ALSA).
-//! The hotkey is read from `/dev/input` via evdev, so it works under both X11 and
-//! Wayland (unlike an X11 key-grab); it needs read access to the input devices,
-//! i.e. membership in the `input` group. ASR is pluggable via the [`Recognizer`]
-//! trait; the default backend shells out to an external command (so it works today
-//! with the Python transducer). A native sherpa-onnx backend can be added behind
-//! its own feature.
+//! Feature-gated (`--features daemon`, which pulls in `sherpa`) because it links
+//! native audio (cpal/ALSA) and the sherpa-onnx recognizer. The hotkey is read from
+//! `/dev/input` via evdev, so it works under both X11 and Wayland (unlike an X11
+//! key-grab); it needs read access to the input devices, i.e. membership in the
+//! `input` group.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -15,19 +15,15 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use crate::asr::{ExternalCommand, Recognizer};
+use crate::asr::{SherpaOpts, SherpaTransducer};
 use crate::grammar::Grammar;
 use crate::hotkey::Combo;
 use crate::wav;
 
 pub struct DaemonConfig {
     pub hotkey: String,
-    /// external ASR command template; `{wav}` is replaced with a temp wav path,
-    /// transcript is read from stdout. Ignored when `sherpa_model` is set.
-    pub asr_cmd: Option<String>,
-    /// directory of a sherpa-onnx transducer model; selects the native backend
-    /// (feature `sherpa`) in preference to `asr_cmd`.
-    pub sherpa_model: Option<PathBuf>,
+    /// directory of the sherpa-onnx transducer model (encoder/decoder/joiner + tokens).
+    pub sherpa_model: PathBuf,
     pub sherpa_provider: Option<String>,
     pub sherpa_threads: Option<i32>,
     /// if set, every processed utterance is written here as a 16 kHz mono WAV plus
@@ -35,7 +31,7 @@ pub struct DaemonConfig {
     /// or building a dataset of the user's own voice.
     pub save_audio: Option<PathBuf>,
     /// auto-derive a hotword list from the grammar and bias the (sherpa) recognizer
-    /// toward it. On by default; needs the sherpa backend + a `bpe.model` in the dir.
+    /// toward it. On by default; needs a `bpe.vocab` in the model dir.
     pub bias: bool,
     /// boost applied to biased hotword phrases.
     pub bias_score: f32,
@@ -137,43 +133,21 @@ fn save_snippet(
     Ok(())
 }
 
-/// Pick the ASR backend from the config: native sherpa-onnx if a model dir is
-/// given, otherwise the external command. `hotwords_file` (when set) biases the
-/// native recognizer toward the grammar's phrases.
+/// Build the sherpa-onnx recognizer from the config. `hotwords_file` (when set)
+/// biases it toward the grammar's phrases.
 fn build_recognizer(
     cfg: &DaemonConfig,
     hotwords_file: Option<&std::path::Path>,
-) -> Result<Box<dyn Recognizer>, String> {
-    if let Some(dir) = &cfg.sherpa_model {
-        #[cfg(feature = "sherpa")]
-        {
-            return crate::asr::SherpaTransducer::from_dir(
-                dir,
-                crate::asr::SherpaOpts {
-                    num_threads: cfg.sherpa_threads,
-                    provider: cfg.sherpa_provider.clone(),
-                    hotwords_file: hotwords_file.map(|p| p.to_path_buf()),
-                    hotwords_score: cfg.bias_score,
-                },
-            )
-            .map(|r| Box::new(r) as Box<dyn Recognizer>);
-        }
-        #[cfg(not(feature = "sherpa"))]
-        {
-            let _ = (dir, hotwords_file);
-            return Err("--sherpa-model needs the `sherpa` feature \
-                 (rebuild: cargo build --features daemon,sherpa)"
-                .to_string());
-        }
-    }
-    if let Some(template) = &cfg.asr_cmd {
-        return Ok(Box::new(ExternalCommand {
-            template: template.clone(),
-        }));
-    }
-    Err("no ASR backend selected: pass --sherpa-model DIR (native) \
-         or --asr-cmd CMD (external, e.g. mic_asr.py --wav {wav})"
-        .to_string())
+) -> Result<SherpaTransducer, String> {
+    SherpaTransducer::from_dir(
+        &cfg.sherpa_model,
+        SherpaOpts {
+            num_threads: cfg.sherpa_threads,
+            provider: cfg.sherpa_provider.clone(),
+            hotwords_file: hotwords_file.map(|p| p.to_path_buf()),
+            hotwords_score: cfg.bias_score,
+        },
+    )
 }
 
 /// Map a live evdev key to the same normalized token space as [`crate::hotkey`].
@@ -371,20 +345,8 @@ enum Capture {
     Wake { silence: usize, heard: bool },
 }
 
-/// The keyword spotter type — only real with feature `sherpa`; an uninhabited stand-in
-/// otherwise, so the capture loop compiles either way (wake mode just can't be entered).
-#[cfg(feature = "sherpa")]
-type Kws = crate::kws::KeywordSpotter;
-#[cfg(not(feature = "sherpa"))]
-enum Kws {}
-
-#[cfg(feature = "sherpa")]
-fn kws_accept(kws: &mut Option<Kws>, frame: &[f32]) -> Option<String> {
+fn kws_accept(kws: &mut Option<crate::kws::KeywordSpotter>, frame: &[f32]) -> Option<String> {
     kws.as_mut().and_then(|k| k.accept(frame, 16_000))
-}
-#[cfg(not(feature = "sherpa"))]
-fn kws_accept(_kws: &mut Option<Kws>, _frame: &[f32]) -> Option<String> {
-    None
 }
 
 fn rms(frame: &[f32]) -> f32 {
@@ -402,7 +364,7 @@ fn is_end_word(kw: &str, end_word: &Option<String>) -> bool {
 /// intent to stdout, and an optional saved snippet.
 fn process_utterance(
     samples: &[f32],
-    recognizer: &dyn Recognizer,
+    recognizer: &SherpaTransducer,
     grammar: &Grammar,
     open_ended: bool,
     save_audio: Option<&std::path::Path>,
@@ -447,8 +409,8 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
     }
 
     // Auto-derive a hotword bias list from the command tree so biasing always
-    // matches the grammar (written to a temp file the sherpa backend reads).
-    let hotwords_path: Option<PathBuf> = if cfg.bias && cfg.sherpa_model.is_some() {
+    // matches the grammar (written to a temp file the recognizer reads).
+    let hotwords_path: Option<PathBuf> = if cfg.bias {
         let phrases = crate::hotwords::hotwords(&grammar);
         let path = std::env::temp_dir().join(format!("cmdtree-hotwords-{}.txt", std::process::id()));
         std::fs::write(&path, crate::hotwords::hotwords_file(&grammar, None))
@@ -474,9 +436,8 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
         );
     }
 
-    // Optional always-on wake-word front-end (needs feature `sherpa`).
-    #[cfg(feature = "sherpa")]
-    let mut kws: Option<Kws> = match &cfg.wake_model {
+    // Optional always-on wake-word front-end.
+    let mut kws: Option<crate::kws::KeywordSpotter> = match &cfg.wake_model {
         Some(dir) => {
             let keywords = cfg
                 .keywords
@@ -501,15 +462,6 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
             Some(spotter)
         }
         None => None,
-    };
-    #[cfg(not(feature = "sherpa"))]
-    let mut kws: Option<Kws> = {
-        if cfg.wake_model.is_some() {
-            return Err("--wake-model needs the `sherpa` feature \
-                 (rebuild: cargo build --features daemon,sherpa)"
-                .to_string());
-        }
-        None
     };
 
     // Continuous mic → frames.
@@ -583,7 +535,7 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
                 if !ptt {
                     process_utterance(
                         &cmd,
-                        recognizer.as_ref(),
+                        &recognizer,
                         &grammar,
                         cfg.open_ended,
                         cfg.save_audio.as_deref(),
@@ -619,7 +571,7 @@ pub fn run(grammar: Grammar, cfg: DaemonConfig) -> Result<(), String> {
                     let end = cmd.len().saturating_sub(trim);
                     process_utterance(
                         &cmd[..end],
-                        recognizer.as_ref(),
+                        &recognizer,
                         &grammar,
                         cfg.open_ended,
                         cfg.save_audio.as_deref(),

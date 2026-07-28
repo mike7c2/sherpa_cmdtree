@@ -21,7 +21,7 @@ crate (`lint/`) for grammar-quality authoring — so the runtime stays minimal.
 | `parser`  | match a transcript → `{command, action, slots, leftover}` |
 | `hotwords` | derive a sherpa-onnx bias list from the grammar |
 | `wav`, `hotkey` | PCM16 WAV encode/resample + hotkey-combo parsing (pure, unit-tested) |
-| `asr` *(feature)* | `Recognizer` trait + external-command / sherpa-onnx backends |
+| `asr` *(feature `sherpa`)* | `SherpaTransducer` → text + per-word timings |
 | `kws` *(feature `sherpa`)* | streaming keyword spotter (wake / end word) |
 | `daemon` *(feature)* | hotkey or wake-word capture → ASR → parse → emit NDJSON |
 
@@ -75,14 +75,10 @@ validated at load time.
 cargo run -p cmdtree-lint -- grammar.example.yaml   # grammar-quality report (add --json)
 cmdtree parse  grammar.example.yaml --text "turn off the kitchen light"
 
-# push-to-talk, external ASR (the Python transducer in this repo):
-cmdtree daemon grammar.example.yaml --hotkey ctrl+space \
-        --asr-cmd '/path/.venv/bin/python /path/mic_asr.py --wav {wav}'
-
-# push-to-talk, native in-process ASR (feature `sherpa`):
+# push-to-talk daemon (feature `daemon`, which pulls in the sherpa recognizer):
 cmdtree daemon grammar.example.yaml --hotkey ctrl+space --sherpa-model models/onnx-zipformer-en
 
-# transcribe a file with the native ASR (no mic/hotkey needed; feature `sherpa`):
+# transcribe a file (no mic/hotkey needed; feature `sherpa`):
 cmdtree transcribe --wav utterance.wav --sherpa-model models/onnx-zipformer-en \
         --grammar grammar.example.yaml
 ```
@@ -94,14 +90,10 @@ for ground truth, synthesize each command and run it back through your recognise
 
 ## Daemon / push-to-talk
 
-Hold the hotkey, speak, release — the captured audio is transcribed and parsed.
-ASR is pluggable via the `asr::Recognizer` trait; two backends ship:
-
-- **`ExternalCommand`** (`--asr-cmd`) — writes the utterance to a temp WAV and runs
-  your command (with `{wav}` substituted), reading the transcript from stdout. Needs
-  no native library, and works today with the Python transducer in this repo.
-- **`SherpaTransducer`** (`--sherpa-model`, feature `sherpa`) — an in-process
-  sherpa-onnx offline transducer via [`sherpa-rs`], no subprocess per utterance.
+Hold the hotkey (or say a wake word), speak, release — the captured audio is
+transcribed by `asr::SherpaTransducer`, an in-process sherpa-onnx offline transducer
+driven directly through [`sherpa-rs`]'s sys layer (so tokens + per-word timestamps are
+available). The `daemon` feature pulls in the recognizer, so `--sherpa-model` is required.
 
 `--sherpa-model` takes a directory holding a sherpa-onnx zipformer transducer —
 `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx` (full-precision preferred over

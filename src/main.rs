@@ -64,14 +64,9 @@ struct DaemonArgs {
     /// hotkey combo to hold while speaking, e.g. "ctrl+space" or "ctrl+alt+k"
     #[arg(long, default_value = "ctrl+space")]
     hotkey: String,
-    /// external ASR command; {wav} is replaced by a temp wav path, transcript read from stdout.
-    /// Example: ".venv/bin/python mic_asr.py --wav {wav}"
+    /// sherpa-onnx transducer model dir (encoder/decoder/joiner ONNX + tokens.txt)
     #[arg(long)]
-    asr_cmd: Option<String>,
-    /// native ASR: directory of a sherpa-onnx transducer model (encoder/decoder/joiner
-    /// ONNX + tokens.txt). Takes precedence over --asr-cmd. Needs --features sherpa.
-    #[arg(long)]
-    sherpa_model: Option<PathBuf>,
+    sherpa_model: PathBuf,
     /// sherpa-onnx execution provider ("cpu", or "cuda" with --features sherpa-cuda)
     #[arg(long)]
     sherpa_provider: Option<String>,
@@ -235,7 +230,6 @@ fn run_daemon(args: DaemonArgs) -> ExitCode {
     };
     let cfg = cmdtree::daemon::DaemonConfig {
         hotkey: args.hotkey,
-        asr_cmd: args.asr_cmd,
         sherpa_model: args.sherpa_model,
         sherpa_provider: args.sherpa_provider,
         sherpa_threads: args.sherpa_threads,
@@ -270,7 +264,7 @@ fn run_daemon(_args: DaemonArgs) -> ExitCode {
 
 #[cfg(feature = "sherpa")]
 fn run_transcribe(args: TranscribeArgs) -> ExitCode {
-    use cmdtree::asr::{Recognizer, SherpaOpts, SherpaTransducer};
+    use cmdtree::asr::{SherpaOpts, SherpaTransducer};
 
     let recognizer = match SherpaTransducer::from_dir(
         &args.sherpa_model,

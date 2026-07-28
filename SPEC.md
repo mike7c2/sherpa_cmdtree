@@ -46,7 +46,7 @@ no quality-linting code.
 | `parser` | match a transcript → `Match{command, action, slots, score, leftover}` | core |
 | `hotwords` | derive the sherpa hotword bias list from the grammar | core |
 | `wav`, `hotkey` | PCM16 WAV encode/resample; hotkey-combo parsing | core |
-| `asr` | `Recognizer` trait + backends (see §5) | feature `daemon`/`sherpa` |
+| `asr` | `SherpaTransducer` (sherpa-onnx recognizer) → `AsrResult` | feature `sherpa` |
 | `kws` | streaming keyword spotter (wake / end word) | feature `sherpa` |
 | `daemon` | hotkey/wake-word capture → ASR → parse → emit | feature `daemon` |
 
@@ -54,9 +54,9 @@ no quality-linting code.
 `phonetics` (espeak G2P + feature-weighted phone distance) and `assess` (confusability
 linter). Needs espeak at runtime; not part of the recognizer.
 
-**Cargo features (cmdtree):** `default = []` · `daemon = [cpal, evdev]` ·
-`sherpa = [sherpa-rs]` · `sherpa-cuda = [sherpa, sherpa-rs/cuda]`. Core
-(grammar/parser/hotwords) builds with no native deps.
+**Cargo features (cmdtree):** `default = []` · `sherpa = [sherpa-rs]` ·
+`daemon = [cpal, evdev, sherpa]` (implies sherpa) · `sherpa-cuda = [sherpa, sherpa-rs/cuda]`.
+Core (grammar/parser/hotwords) builds with no native deps.
 
 **CLI:** `cmdtree` → `parse` · `hotwords` · `daemon` · `transcribe` · `spot`.
 `cmdtree-lint <grammar> [--json]` → the quality report.
@@ -81,13 +81,14 @@ stays in the grammar and is still consumed when present.
 
 ## 5. ASR
 
-`asr::Recognizer::recognize(samples, rate) -> AsrResult{ text, tokens:[{text,start}] }`.
+One backend: `asr::SherpaTransducer` (feature `sherpa`).
+`recognize(samples, rate) -> AsrResult{ text, tokens:[{text,start}] }`.
 
-- **`SherpaTransducer`** (feature `sherpa`) — sherpa-onnx **offline** transducer driven
-  **directly via `sherpa-rs-sys`** (not the high-level wrapper, so tokens + timestamps are
-  available). 16 kHz mono. `words()` merges sub-words → words (boundary = leading space).
-- **`ExternalCommand`** — shells out to any ASR command (`{wav}` → transcript on stdout);
-  text only. Works with the repo's Python transducer.
+- sherpa-onnx **offline** transducer driven **directly via `sherpa-rs-sys`** (not the
+  high-level wrapper, so tokens + timestamps are available). 16 kHz mono. `words()`
+  merges sub-words → words (boundary = leading space).
+- No trait / no external-command backend: the recognizer is concrete, so `daemon`
+  implies `sherpa` and `--sherpa-model` is required.
 
 **Hotword biasing** (auto, on by default): the daemon derives a bias list from the grammar
 (`hotwords`), writes it, and enables contextual biasing. Requires a `bpe.vocab` in the model

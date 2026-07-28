@@ -1,13 +1,8 @@
-//! Speech recognition backends. A [`Recognizer`] turns a mono f32 utterance (at a
-//! known sample rate) into an [`AsrResult`] — the text plus, when the backend can
-//! provide them, the sub-word tokens with timestamps. Two backends ship:
-//!
-//! * [`ExternalCommand`] — write the utterance to a temp WAV and shell out to any
-//!   ASR command (works today with the Python transducer in this repo). Text only.
-//! * [`SherpaTransducer`] *(feature `sherpa`)* — an in-process sherpa-onnx offline
-//!   transducer, driven **directly through `sherpa-rs-sys`** so we can read the full
-//!   result (tokens + per-token timestamps), which `sherpa-rs`'s high-level
-//!   `transcribe()` discards. Supports hotword biasing.
+//! In-process sherpa-onnx recognition. [`SherpaTransducer`] turns a mono f32
+//! utterance into an [`AsrResult`] — the text plus sub-word tokens with timestamps.
+//! It is driven **directly through `sherpa-rs-sys`** so we can read the full result
+//! (tokens + per-token timestamps), which `sherpa-rs`'s high-level `transcribe()`
+//! discards, and it supports hotword biasing.
 
 /// A recognized sub-word token and its start time, in seconds.
 #[derive(Debug, Clone)]
@@ -16,8 +11,7 @@ pub struct AsrToken {
     pub start: f32,
 }
 
-/// A recognition result: the text, plus sub-word tokens with timestamps when the
-/// backend provides them (empty for text-only backends).
+/// A recognition result: the text plus sub-word tokens with timestamps.
 #[derive(Debug, Clone, Default)]
 pub struct AsrResult {
     pub text: String,
@@ -25,13 +19,6 @@ pub struct AsrResult {
 }
 
 impl AsrResult {
-    pub fn text_only(text: String) -> Self {
-        Self {
-            text,
-            tokens: Vec::new(),
-        }
-    }
-
     /// Merge sub-word tokens into words. sherpa marks a word start with a leading
     /// space (the C API translates BPE's `▁`); other pieces attach to the current
     /// word. Returns `(word, start_s)` with the start time of the word's first token.
@@ -51,52 +38,12 @@ impl AsrResult {
     }
 }
 
-/// Anything that turns a mono f32 utterance into a recognition result.
-pub trait Recognizer: Send {
-    /// `samples` is mono f32 in [-1, 1] at `sample_rate` Hz.
-    fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<AsrResult, String>;
-}
-
-/// Shell out to an external ASR command (e.g. the Python transducer). The utterance
-/// is written to a temp WAV whose path replaces `{wav}` in the template; the
-/// transcript is read from stdout. Text only (no token timings).
-pub struct ExternalCommand {
-    pub template: String,
-}
-
-impl Recognizer for ExternalCommand {
-    fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<AsrResult, String> {
-        let pcm = crate::wav::f32_to_i16(samples);
-        let wav_bytes = crate::wav::encode_pcm16_mono(&pcm, sample_rate);
-        let path = std::env::temp_dir().join(format!("cmdtree-{}.wav", std::process::id()));
-        std::fs::write(&path, &wav_bytes).map_err(|e| e.to_string())?;
-        let cmd = self.template.replace("{wav}", &path.to_string_lossy());
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()
-            .map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_file(&path);
-        if !out.status.success() {
-            return Err(format!(
-                "asr command failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-        Ok(AsrResult::text_only(
-            String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        ))
-    }
-}
-
-#[cfg(feature = "sherpa")]
 pub use sherpa_backend::{SherpaOpts, SherpaTransducer};
 
 /// In-process sherpa-onnx offline transducer, driven directly through the C API
 /// (`sherpa-rs-sys`) so the full result — tokens + timestamps — is available.
-#[cfg(feature = "sherpa")]
 mod sherpa_backend {
-    use super::{AsrResult, AsrToken, Recognizer};
+    use super::{AsrResult, AsrToken};
     use sherpa_rs::sherpa_rs_sys as sys;
     use std::ffi::{CStr, CString};
     use std::os::raw::c_char;
@@ -216,8 +163,9 @@ mod sherpa_backend {
         }
     }
 
-    impl Recognizer for SherpaTransducer {
-        fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<AsrResult, String> {
+    impl SherpaTransducer {
+        /// Recognise one mono f32 utterance at `sample_rate` Hz.
+        pub fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<AsrResult, String> {
             let rec = self
                 .inner
                 .lock()

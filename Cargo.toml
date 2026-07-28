@@ -33,7 +33,7 @@ default = []
 # push-to-talk daemon with hotkey + mic capture; ASR via a pluggable backend.
 # The hotkey is read from /dev/input via evdev, so it works under both X11 and
 # Wayland (needs read access to /dev/input, i.e. membership in the `input` group).
-daemon = ["dep:cpal", "dep:evdev"]
+daemon = ["dep:cpal", "dep:evdev", "sherpa"]
 # native in-process ASR (sherpa-onnx offline transducer) + the `transcribe` CLI.
 sherpa = ["dep:sherpa-rs"]
 # sherpa with the CUDA execution provider (large GPU runtime download).

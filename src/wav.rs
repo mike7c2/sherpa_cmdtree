@@ -1,5 +1,5 @@
-//! Minimal PCM-16 mono WAV encoder (no external crate), used to hand a captured
-//! utterance to an external ASR command.
+//! PCM-16 mono WAV encoding, f32→i16 conversion, and linear resampling for
+//! captured audio.
 
 /// Encode mono 16-bit PCM samples as a WAV byte buffer at `sample_rate` Hz.
 pub fn encode_pcm16_mono(samples: &[i16], sample_rate: u32) -> Vec<u8> {
