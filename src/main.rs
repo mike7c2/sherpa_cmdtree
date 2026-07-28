@@ -143,66 +143,51 @@ fn load(grammar: &PathBuf) -> Result<Grammar, String> {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Parse { grammar, text, json } => {
-            let g = match load(&grammar) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match g.parse(&text) {
-                Some(m) => {
-                    if json {
-                        let mut slots = serde_json::Map::new();
-                        for (k, v) in &m.slots {
-                            slots.insert(k.clone(), serde_json::Value::String(v.clone()));
-                        }
-                        let obj = serde_json::json!({
-                            "command": m.command,
-                            "action": m.action,
-                            "slots": slots,
-                            "leftover": m.leftover,
-                        });
-                        println!("{}", serde_json::to_string_pretty(&obj).unwrap());
-                    } else {
-                        print_match(&m);
-                    }
-                    ExitCode::SUCCESS
-                }
-                None => {
-                    println!("(no command recognised)");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Cmd::Hotwords { grammar, score, out } => {
-            let g = match load(&grammar) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let text = cmdtree::hotwords::hotwords_file(&g, score);
-            match out {
-                Some(path) => {
-                    if let Err(e) = std::fs::write(&path, &text) {
-                        eprintln!("error writing {}: {e}", path.display());
-                        return ExitCode::FAILURE;
-                    }
-                    eprintln!("wrote {} hotword phrases to {}", text.lines().count(), path.display());
-                }
-                None => print!("{text}"),
-            }
-            ExitCode::SUCCESS
-        }
+    let outcome = match Cli::parse().cmd {
+        Cmd::Parse { grammar, text, json } => run_parse(grammar, text, json),
+        Cmd::Hotwords { grammar, score, out } => run_hotwords(grammar, score, out),
         Cmd::Daemon(args) => run_daemon(args),
         Cmd::Transcribe(args) => run_transcribe(args),
         Cmd::Spot(args) => run_spot(args),
+    };
+    outcome.unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+fn run_parse(grammar: PathBuf, text: String, json: bool) -> Result<ExitCode, String> {
+    let g = load(&grammar)?;
+    let Some(m) = g.parse(&text) else {
+        println!("(no command recognised)");
+        return Ok(ExitCode::FAILURE);
+    };
+    if json {
+        let slots: serde_json::Map<String, serde_json::Value> = m
+            .slots
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        let obj = serde_json::json!({
+            "command": m.command, "action": m.action, "slots": slots, "leftover": m.leftover,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+    } else {
+        print_match(&m);
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_hotwords(grammar: PathBuf, score: Option<f32>, out: Option<PathBuf>) -> Result<ExitCode, String> {
+    let text = cmdtree::hotwords::hotwords_file(&load(&grammar)?, score);
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+            eprintln!("wrote {} hotword phrases to {}", text.lines().count(), path.display());
+        }
+        None => print!("{text}"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Print a matched command as a human-readable block (shared by `parse` and `transcribe`).
@@ -220,14 +205,7 @@ fn print_match(m: &cmdtree::parser::Match) {
 }
 
 #[cfg(feature = "daemon")]
-fn run_daemon(args: DaemonArgs) -> ExitCode {
-    let g = match load(&args.grammar) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+fn run_daemon(args: DaemonArgs) -> Result<ExitCode, String> {
     let cfg = cmdtree::daemon::DaemonConfig {
         hotkey: args.hotkey,
         sherpa_model: args.sherpa_model,
@@ -244,29 +222,15 @@ fn run_daemon(args: DaemonArgs) -> ExitCode {
         silence_secs: args.silence,
         max_utterance_secs: args.max_utterance,
     };
-    match cmdtree::daemon::run(g, cfg) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("daemon error: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-#[cfg(not(feature = "daemon"))]
-fn run_daemon(_args: DaemonArgs) -> ExitCode {
-    eprintln!(
-        "the `daemon` subcommand needs the daemon feature.\n\
-         rebuild with:  cargo build --release --features daemon"
-    );
-    ExitCode::FAILURE
+    cmdtree::daemon::run(load(&args.grammar)?, cfg)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(feature = "sherpa")]
-fn run_transcribe(args: TranscribeArgs) -> ExitCode {
+fn run_transcribe(args: TranscribeArgs) -> Result<ExitCode, String> {
     use cmdtree::asr::{SherpaOpts, SherpaTransducer};
 
-    let recognizer = match SherpaTransducer::from_dir(
+    let recognizer = SherpaTransducer::from_dir(
         &args.sherpa_model,
         SherpaOpts {
             num_threads: args.sherpa_threads,
@@ -274,85 +238,40 @@ fn run_transcribe(args: TranscribeArgs) -> ExitCode {
             hotwords_file: args.hotwords,
             hotwords_score: args.bias_score,
         },
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let (samples, sample_rate) = match sherpa_rs::read_audio_file(&args.wav.to_string_lossy()) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", args.wav.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let res = match recognizer.recognize(&samples, sample_rate) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("asr error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    )?;
+    let (samples, sample_rate) = sherpa_rs::read_audio_file(&args.wav.to_string_lossy())
+        .map_err(|e| format!("reading {}: {e}", args.wav.display()))?;
+    let res = recognizer.recognize(&samples, sample_rate)?;
     println!("transcript: {:?}", res.text);
     if args.tokens {
         for (w, t) in res.words() {
             println!("  {t:6.2}s  {w}");
         }
     }
-
     if let Some(grammar) = &args.grammar {
-        let g = match load(grammar) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        match g.parse(&res.text) {
+        match load(grammar)?.parse(&res.text) {
             Some(m) => print_match(&m),
             None => println!("(no command recognised)"),
         }
     }
-    ExitCode::SUCCESS
-}
-
-#[cfg(not(feature = "sherpa"))]
-fn run_transcribe(_args: TranscribeArgs) -> ExitCode {
-    eprintln!(
-        "the `transcribe` subcommand needs the sherpa feature.\n\
-         rebuild with:  cargo build --release --features sherpa"
-    );
-    ExitCode::FAILURE
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(feature = "sherpa")]
-fn run_spot(args: SpotArgs) -> ExitCode {
+fn run_spot(args: SpotArgs) -> Result<ExitCode, String> {
     let keywords = args
         .keywords
         .unwrap_or_else(|| args.kws_model.join("keywords.txt"));
-    let mut spotter = match cmdtree::kws::KeywordSpotter::from_dir(
+    let mut spotter = cmdtree::kws::KeywordSpotter::from_dir(
         &args.kws_model,
         cmdtree::kws::KwsOpts {
             keywords_file: keywords,
             threshold: args.threshold,
             ..Default::default()
         },
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let (samples, sample_rate) = match sherpa_rs::read_audio_file(&args.wav.to_string_lossy()) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", args.wav.display());
-            return ExitCode::FAILURE;
-        }
-    };
+    )?;
+    let (samples, sample_rate) = sherpa_rs::read_audio_file(&args.wav.to_string_lossy())
+        .map_err(|e| format!("reading {}: {e}", args.wav.display()))?;
     // feed in 100 ms chunks, reporting hits with their approximate time
     let chunk = (sample_rate / 10).max(1) as usize;
     let mut hits = 0;
@@ -364,14 +283,20 @@ fn run_spot(args: SpotArgs) -> ExitCode {
         }
     }
     eprintln!("{hits} keyword hit(s) in {}", args.wav.display());
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(feature = "daemon"))]
+fn run_daemon(_args: DaemonArgs) -> Result<ExitCode, String> {
+    Err("the `daemon` subcommand needs the daemon feature (rebuild with --features daemon)".into())
 }
 
 #[cfg(not(feature = "sherpa"))]
-fn run_spot(_args: SpotArgs) -> ExitCode {
-    eprintln!(
-        "the `spot` subcommand needs the sherpa feature.\n\
-         rebuild with:  cargo build --release --features sherpa"
-    );
-    ExitCode::FAILURE
+fn run_transcribe(_args: TranscribeArgs) -> Result<ExitCode, String> {
+    Err("the `transcribe` subcommand needs the sherpa feature (rebuild with --features sherpa)".into())
+}
+
+#[cfg(not(feature = "sherpa"))]
+fn run_spot(_args: SpotArgs) -> Result<ExitCode, String> {
+    Err("the `spot` subcommand needs the sherpa feature (rebuild with --features sherpa)".into())
 }
