@@ -1,0 +1,25 @@
+[package]
+name = "cmdtree-decode"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Experiment: score cmdtree grammar candidates directly against the acoustics (RNN-T forward rescoring) instead of transcribing then text-matching. See EXPERIMENT.md."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mike7c2/cmdtree"
+publish = false
+
+[dependencies]
+cmdtree = { path = ".." }          # grammar types only
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The implementer adds these (see EXPERIMENT.md §2) — left out until M1 so the
+# skeleton builds clean:
+#   ort              ONNX Runtime: encoder / decoder / joiner
+#   <fbank>          80-dim kaldi-compatible filterbank; MUST match sherpa exactly
+#   <sentencepiece>  bpe.model tokenisation (must round-trip)
+
+[[bin]]
+name = "cmdtree-decode"
+path = "src/main.rs"

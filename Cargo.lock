@@ -262,6 +262,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmdtree-decode"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cmdtree",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cmdtree-lint"
 version = "0.1.0"
 dependencies = [

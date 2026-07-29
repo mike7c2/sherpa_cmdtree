@@ -1,5 +1,5 @@
 [workspace]
-members = ["lint"]
+members = ["lint", "decode"]
 resolver = "2"
 
 [package]
