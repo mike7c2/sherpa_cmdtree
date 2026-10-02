@@ -13,6 +13,8 @@ cmdtree = { path = ".." }          # grammar types only
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ort = "2.0.0-rc.13"
+knf-rs-sys = "0.3.2"
 
 # The implementer adds these (see EXPERIMENT.md §2) — left out until M1 so the
 # skeleton builds clean:
